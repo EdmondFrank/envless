@@ -1,4 +1,4 @@
-module github.com/envless-sh/envless
+module github.com/biliboss/envless
 
 go 1.26
 

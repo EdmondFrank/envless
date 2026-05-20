@@ -220,7 +220,7 @@ envless/
 
 ## Release: goreleaser + esbuild-pattern npm wrap (optionalDependencies + SHA256 hashes)
 
-## Module: single `github.com/envless-sh/envless`. Apache-2.0.
+## Module: single `github.com/biliboss/envless`. Apache-2.0.
 
 ## Risky parts (TDD priority order)
 

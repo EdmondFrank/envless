@@ -6,8 +6,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/envless-sh/envless/internal/execenv"
-	"github.com/envless-sh/envless/internal/store"
+	"github.com/biliboss/envless/internal/execenv"
+	"github.com/biliboss/envless/internal/store"
 )
 
 func newExecCmd() *cobra.Command {

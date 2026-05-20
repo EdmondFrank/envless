@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/envless-sh/envless/internal/store"
-	"github.com/envless-sh/envless/pkg/envparse"
+	"github.com/biliboss/envless/internal/store"
+	"github.com/biliboss/envless/pkg/envparse"
 )
 
 func newMigrateCmd() *cobra.Command {

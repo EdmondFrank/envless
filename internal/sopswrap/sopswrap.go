@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/envless-sh/envless/pkg/envparse"
+	"github.com/biliboss/envless/pkg/envparse"
 )
 
 // Encrypt serializes kv as a dotenv document and writes a sops-encrypted file at dst.

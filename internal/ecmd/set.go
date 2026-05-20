@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/envless-sh/envless/internal/store"
+	"github.com/biliboss/envless/internal/store"
 )
 
 func newSetCmd() *cobra.Command {

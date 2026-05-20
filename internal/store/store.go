@@ -12,7 +12,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/envless-sh/envless/internal/sopswrap"
+	"github.com/biliboss/envless/internal/sopswrap"
 )
 
 // Store represents an envless-managed repository rooted at Root.

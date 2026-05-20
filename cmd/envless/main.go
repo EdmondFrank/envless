@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/envless-sh/envless/internal/ecmd"
+	"github.com/biliboss/envless/internal/ecmd"
 )
 
 var version = "dev"
