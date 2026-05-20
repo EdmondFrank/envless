@@ -1,0 +1,45 @@
+---
+title: envless
+description: Agent-first secrets. Zero .env files. Zero servers.
+template: splash
+hero:
+  tagline: Kill .env. Keep process.env. Skill drives setup.
+  actions:
+    - text: Install
+      link: ./getting-started/install/
+      icon: right-arrow
+      variant: primary
+    - text: GitHub
+      link: https://github.com/biliboss/envless
+      icon: external
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## What
+
+`envless` is a thin Go CLI on top of [age](https://github.com/FiloSottile/age) + [sops](https://github.com/getsops/sops) that:
+
+- replaces `.env` files with encrypted-in-repo `secrets/*.env.enc`
+- preserves the `process.env.X` interface — language-agnostic via `execve`
+- treats every team member, agent, and CI runner as a first-class identity
+- ships nothing to a server, no account, no SaaS
+
+<CardGrid>
+  <Card title="One verb" icon="rocket">
+    `envless exec -- node app.js` — secrets injected at fork time.
+  </Card>
+  <Card title="No SDK" icon="puzzle">
+    Your code keeps reading `process.env.X`. No library import.
+  </Card>
+  <Card title="Per-agent identity" icon="seti:lock">
+    Revoke by removing a pubkey. No shared password.
+  </Card>
+  <Card title="Caveman output" icon="document">
+    One line per action. No spinners. No banners.
+  </Card>
+</CardGrid>
+
+## Status
+
+v0.0.1 — single-user core. Teams + plugins + skill in v0.1.

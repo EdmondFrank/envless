@@ -1,5 +1,8 @@
 bin/
 dist/
+docs/dist/
+docs/.astro/
+.claude/
 coverage.out
 *.test
 *.prof

@@ -1,0 +1,16 @@
+:root {
+  --sl-font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --sl-font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+:root[data-theme="dark"] {
+  --sl-color-accent-low: #2a1a14;
+  --sl-color-accent: #d96e3a;
+  --sl-color-accent-high: #f2a07a;
+}
+
+:root[data-theme="light"] {
+  --sl-color-accent-low: #fce6d8;
+  --sl-color-accent: #b23a1f;
+  --sl-color-accent-high: #5c1d0e;
+}
