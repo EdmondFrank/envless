@@ -1,0 +1,10 @@
+bin/
+dist/
+coverage.out
+*.test
+*.prof
+.envless/identity.key
+.envless/inbox/
+.research/repos/
+node_modules/
+.DS_Store
