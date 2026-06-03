@@ -17,6 +17,7 @@ const DOCS_ROOT = resolve(__dirname, "..", "..");
 const REPO_ROOT = resolve(DOCS_ROOT, "..");
 const FALLBACK = join(DOCS_ROOT, "src", "data", "releases.json");
 const BENCH_DIR = join(REPO_ROOT, "bench", "results");
+const BENCH_HISTORY = join(REPO_ROOT, "bench", "history.jsonl");
 const REPO = "biliboss/envless";
 
 export interface ReleaseAsset {
@@ -95,26 +96,95 @@ function loadFallback(): GithubRelease[] {
   }
 }
 
+interface HistoryEntry {
+  schema_version: number;
+  sha: string;
+  short?: string;
+  timestamp: string;
+  metrics: Record<string, number>;
+}
+
+function unitFor(key: string): string {
+  if (key.endsWith("_bytes")) return "B";
+  if (key.endsWith("_sec")) return "s";
+  return "";
+}
+
+function toBenchRecord(metrics: Record<string, number>): BenchRecord {
+  const out: BenchRecord = {};
+  for (const [k, v] of Object.entries(metrics)) {
+    if (typeof v !== "number") continue;
+    out[k] = { value: v, unit: unitFor(k), lowerIsBetter: true };
+  }
+  return out;
+}
+
 function loadBenchResults(): Map<string, BenchRecord> {
   const out = new Map<string, BenchRecord>();
-  if (!existsSync(BENCH_DIR)) return out;
-  let files: string[] = [];
-  try {
-    files = readdirSync(BENCH_DIR).filter((f) => f.endsWith(".json"));
-  } catch {
-    return out;
-  }
-  for (const f of files) {
+
+  // Primary source: bench/history.jsonl (append-only summary index).
+  if (existsSync(BENCH_HISTORY)) {
     try {
-      const sha = f.replace(/\.json$/, "");
-      const data = JSON.parse(
-        readFileSync(join(BENCH_DIR, f), "utf8"),
-      ) as BenchRecord;
-      out.set(sha, data);
+      const lines = readFileSync(BENCH_HISTORY, "utf8").split("\n");
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const entry = JSON.parse(trimmed) as HistoryEntry;
+          if (!entry.sha || !entry.metrics) continue;
+          out.set(entry.sha, toBenchRecord(entry.metrics));
+        } catch (err) {
+          console.warn(`[releases] failed to parse history line:`, err);
+        }
+      }
     } catch (err) {
-      console.warn(`[releases] failed to parse ${f}:`, err);
+      console.warn(`[releases] failed to read history.jsonl:`, err);
     }
   }
+
+  // No history.jsonl yet — fall back to per-SHA verbose files for bootstrap.
+  if (out.size === 0 && existsSync(BENCH_DIR)) {
+    let files: string[] = [];
+    try {
+      files = readdirSync(BENCH_DIR).filter((f) => f.endsWith(".json"));
+    } catch {
+      return out;
+    }
+    for (const f of files) {
+      try {
+        const sha = f.replace(/\.json$/, "");
+        const data = JSON.parse(readFileSync(join(BENCH_DIR, f), "utf8")) as {
+          toolchains?: Array<Record<string, unknown>>;
+        };
+        const metrics: Record<string, number> = {};
+        for (const t of data.toolchains ?? []) {
+          const label = String(t.label ?? "");
+          if (!label) continue;
+          const pick = (k: string, src: unknown): void => {
+            if (typeof src === "number") metrics[`${label}.${k}`] = src;
+            else if (
+              src &&
+              typeof src === "object" &&
+              typeof (src as { mean?: number }).mean === "number"
+            ) {
+              metrics[`${label}.${k}`] = (src as { mean: number }).mean;
+            }
+          };
+          pick("build_time_sec", t.build_time_sec);
+          pick("cold_start_sec", t.cold_start_sec);
+          pick("list_latency_sec", t.list_latency_sec);
+          pick("exec_latency_sec", t.exec_latency_sec);
+          pick("binary_size_bytes", t.binary_size_bytes);
+          pick("peak_rss_bytes", t.peak_rss_bytes);
+          pick("e2e_wallclock_sec", t.e2e_wallclock_sec);
+        }
+        out.set(sha, toBenchRecord(metrics));
+      } catch (err) {
+        console.warn(`[releases] failed to parse ${f}:`, err);
+      }
+    }
+  }
+
   return out;
 }
 

@@ -234,3 +234,46 @@ jq -n \
    }' > "$OUT_FILE"
 
 echo "==> wrote $OUT_FILE"
+
+# --- append summary line to history.jsonl ------------------------------------------
+# bench/history.jsonl is the agent-friendly summary index: one line per run,
+# flat metrics keyed by `<toolchain>.<metric>`, consumed by the docs changelog.
+# The verbose per-SHA JSON above stays as the forensic source of truth.
+HISTORY_FILE="$SCRIPT_DIR/history.jsonl"
+jq -c \
+  --arg sha "$GIT_SHA" \
+  --arg short "$GIT_SHORT" \
+  --arg ts "$TIMESTAMP" \
+  --arg os "$OS_NAME" \
+  --arg arch "$ARCH_NAME" \
+  --arg go_v "$GO_VERSION" \
+  --argjson zig_v "$ZIG_VERSION" \
+  --arg hf_v "$HYPERFINE_VERSION" \
+  --slurpfile toolchains "$TOOLCHAINS_JSON" \
+  '{
+     schema_version: 1,
+     sha: $sha,
+     short: $short,
+     timestamp: $ts,
+     platform: { os: $os, arch: $arch },
+     toolchain_versions: { go: $go_v, zig: $zig_v, hyperfine: $hf_v },
+     metrics: (
+       $toolchains[0]
+       | map(
+           . as $t
+           | [
+               {key: ($t.label + ".build_time_sec"),    value: $t.build_time_sec.mean},
+               {key: ($t.label + ".cold_start_sec"),    value: $t.cold_start_sec.mean},
+               {key: ($t.label + ".list_latency_sec"),  value: $t.list_latency_sec.mean},
+               {key: ($t.label + ".exec_latency_sec"),  value: $t.exec_latency_sec.mean},
+               {key: ($t.label + ".binary_size_bytes"), value: $t.binary_size_bytes},
+               {key: ($t.label + ".peak_rss_bytes"),    value: $t.peak_rss_bytes},
+               {key: ($t.label + ".e2e_wallclock_sec"), value: $t.e2e_wallclock_sec}
+             ]
+         )
+       | add
+       | from_entries
+     )
+   }' >> "$HISTORY_FILE"
+
+echo "==> appended summary to $HISTORY_FILE"
