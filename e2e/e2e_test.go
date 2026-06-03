@@ -13,6 +13,13 @@ import (
 var binPath string
 
 func TestMain(m *testing.M) {
+	// If BIN is set, run the suite against that prebuilt binary as-is.
+	// This lets a foreign toolchain (e.g., the Zig port) reuse this suite
+	// as a parity oracle without modifying any test assertion.
+	if bin := os.Getenv("BIN"); bin != "" {
+		binPath = bin
+		os.Exit(m.Run())
+	}
 	tmp, err := os.MkdirTemp("", "envless-bin-")
 	if err != nil {
 		panic(err)

@@ -1,0 +1,55 @@
+name: ci-zig
+
+on:
+  push:
+    branches: [main, zig-port]
+  pull_request:
+
+# Build and test the Zig port of envless on Linux. The Go CI workflow
+# (.github/workflows/ci.yml) is unchanged; this job runs in parallel and
+# proves the Zig binary passes the same end-to-end suite as the Go binary.
+jobs:
+  zig-build-and-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: pin zig version
+        id: zig
+        run: echo "version=$(cat zig/.zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ steps.zig.outputs.version }}
+
+      - name: install age + sops
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y age
+          curl -sSfL -o /tmp/sops https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64
+          sudo install -m 0755 /tmp/sops /usr/local/bin/sops
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: zig build test
+        working-directory: zig
+        run: zig build test
+
+      - name: zig build (release binary)
+        working-directory: zig
+        run: |
+          zig build -Doptimize=ReleaseSmall -Dversion=ci
+          test -x zig-out/bin/envless
+          zig-out/bin/envless --version
+
+      - name: e2e against Zig binary
+        env:
+          BIN: ${{ github.workspace }}/zig/zig-out/bin/envless
+        run: |
+          # The e2e harness defaults to building from source via TestMain when
+          # BIN is unset; with BIN set the harness runs the prebuilt binary
+          # for every assertion. See e2e/e2e_test.go.
+          go test -count=1 ./e2e/...
