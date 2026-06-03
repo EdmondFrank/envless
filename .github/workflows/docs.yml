@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'docs/**'
+      - 'bench/results/**'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -35,6 +36,10 @@ jobs:
           cache-dependency-path: docs/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+        env:
+          # Lets src/lib/releases.ts hit the GH API without being rate-limited
+          # to 60 req/hr. The token is repo-scoped and read-only for public data.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: docs/dist

@@ -1,0 +1,106 @@
+---
+import type { BenchRecord } from "../lib/releases.ts";
+
+interface Props {
+  bench: BenchRecord | null;
+  prev: BenchRecord | null;
+}
+
+const { bench, prev } = Astro.props;
+
+type Row = {
+  key: string;
+  current: number;
+  unit: string;
+  delta: number | null;
+  pct: number | null;
+  lowerIsBetter: boolean;
+};
+
+const rows: Row[] = bench
+  ? Object.entries(bench).map(([key, m]) => {
+      const lowerIsBetter = m.lowerIsBetter ?? true;
+      const prevVal = prev?.[key]?.value;
+      const delta =
+        typeof prevVal === "number" ? m.value - prevVal : null;
+      const pct =
+        typeof prevVal === "number" && prevVal !== 0
+          ? ((m.value - prevVal) / prevVal) * 100
+          : null;
+      return {
+        key,
+        current: m.value,
+        unit: m.unit,
+        delta,
+        pct,
+        lowerIsBetter,
+      };
+    })
+  : [];
+
+function formatNumber(n: number): string {
+  if (!Number.isFinite(n)) return String(n);
+  if (Math.abs(n) >= 1000) return n.toLocaleString();
+  if (Math.abs(n) >= 10) return n.toFixed(1);
+  return n.toFixed(2);
+}
+
+function colorFor(row: Row): string {
+  if (row.delta === null) return "var(--sl-color-gray-3, #9ca3af)";
+  const improved =
+    (row.lowerIsBetter && row.delta < 0) ||
+    (!row.lowerIsBetter && row.delta > 0);
+  if (row.delta === 0) return "var(--sl-color-gray-3, #9ca3af)";
+  return improved ? "#16a34a" : "#dc2626";
+}
+
+function arrow(row: Row): string {
+  if (row.delta === null || row.delta === 0) return "—";
+  return row.delta < 0 ? "▼" : "▲";
+}
+---
+
+{rows.length === 0 ? (
+  <p style="color: var(--sl-color-gray-3); font-style: italic; margin-top: 0.5rem;">
+    No benchmark data for this release yet. Performance numbers land
+    automatically once <code>bench/results/&lt;sha&gt;.json</code> is
+    committed for the release SHA.
+  </p>
+) : (
+  <table style="width: 100%; border-collapse: collapse; font-size: 0.95em; margin-top: 0.5rem;">
+    <thead>
+      <tr style="border-bottom: 1px solid var(--sl-color-gray-5, #374151);">
+        <th style="text-align: left; padding: 0.4rem 0.6rem;">Metric</th>
+        <th style="text-align: right; padding: 0.4rem 0.6rem;">Value</th>
+        <th style="text-align: right; padding: 0.4rem 0.6rem;">Δ vs prev</th>
+        <th style="text-align: right; padding: 0.4rem 0.6rem;">%</th>
+      </tr>
+    </thead>
+    <tbody>
+      {rows.map((row) => (
+        <tr style="border-bottom: 1px solid var(--sl-color-gray-6, #1f2937);">
+          <td style="padding: 0.4rem 0.6rem; font-family: var(--sl-font-mono);">
+            {row.key}
+          </td>
+          <td style="padding: 0.4rem 0.6rem; text-align: right; font-variant-numeric: tabular-nums;">
+            {formatNumber(row.current)} <span style="opacity:0.6;">{row.unit}</span>
+          </td>
+          <td
+            style={`padding: 0.4rem 0.6rem; text-align: right; font-variant-numeric: tabular-nums; color: ${colorFor(row)};`}
+          >
+            {row.delta === null
+              ? "—"
+              : `${arrow(row)} ${formatNumber(Math.abs(row.delta))} ${row.unit}`}
+          </td>
+          <td
+            style={`padding: 0.4rem 0.6rem; text-align: right; font-variant-numeric: tabular-nums; color: ${colorFor(row)};`}
+          >
+            {row.pct === null
+              ? "—"
+              : `${row.pct > 0 ? "+" : ""}${row.pct.toFixed(1)}%`}
+          </td>
+        </tr>
+      ))}
+    </tbody>
+  </table>
+)}

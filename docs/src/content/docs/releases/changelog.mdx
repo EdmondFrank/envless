@@ -1,0 +1,21 @@
+---
+title: Changelog
+description: Every envless release, newest first, joined to its benchmark deltas.
+---
+
+import ReleaseCard from "../../../components/ReleaseCard.astro";
+import { getReleases } from "../../../lib/releases.ts";
+
+export const releases = await getReleases();
+
+The list below is built at site-build time from the GitHub Releases API,
+joined to per-release benchmark JSON files under `bench/results/`. New
+tags appear here automatically on the next docs deploy — no manual
+updates per release. See [Contributing → Release process](../../contributing/releases/)
+for the workflow.
+
+{releases.length === 0 ? (
+  <p><em>No releases have been published yet.</em></p>
+) : (
+  releases.map((release) => <ReleaseCard release={release} />)
+)}
