@@ -56,6 +56,8 @@ pub fn build(b: *std.Build) void {
         "src/execenv.zig",
         "src/sops.zig",
         "src/store.zig",
+        "src/cli/root.zig",
+        "src/cli/migrate.zig",
     };
     var test_files: [all_test_files.len][]const u8 = undefined;
     var n_tests: usize = 0;
