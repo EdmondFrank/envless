@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "git_sha": "49dc6f2a90f1512fb6ba91790b255a064f0fab9b",
+  "git_short": "49dc6f2",
+  "timestamp": "2026-06-03T22:02:28Z",
+  "platform": {
+    "os": "Darwin",
+    "arch": "arm64"
+  },
+  "toolchain_versions": {
+    "go": "go1.26.0",
+    "zig": null,
+    "hyperfine": "1.20.0"
+  },
+  "toolchains": [
+    {
+      "label": "go",
+      "binary": "/Users/billiboss/src/envless/.claude/worktrees/agent-a659bcc7db40931fa/bin/envless",
+      "binary_size_bytes": 2725874,
+      "build_time_sec": {
+        "mean": 0.15977494986000002,
+        "stddev": 0.012979948027338347,
+        "min": 0.14738265856000002,
+        "max": 0.18376857456000004,
+        "runs": 10
+      },
+      "cold_start_sec": {
+        "mean": 0.001804901560000001,
+        "stddev": 0.00044464449069920236,
+        "min": 0.0012514200600000007,
+        "max": 0.0033869210600000013,
+        "runs": 50
+      },
+      "list_latency_sec": {
+        "mean": 0.015972111559999995,
+        "stddev": 0.0008223101624321644,
+        "min": 0.014760794960000002,
+        "max": 0.01762321196,
+        "runs": 30
+      },
+      "exec_latency_sec": {
+        "mean": 0.018031972506666667,
+        "stddev": 0.0013357648918371535,
+        "min": 0.01627191454,
+        "max": 0.02320383054,
+        "runs": 30
+      },
+      "peak_rss_bytes": 35323904,
+      "e2e_wallclock_sec": 4.478
+    }
+  ]
+}

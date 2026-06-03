@@ -1,0 +1,88 @@
+name: bench
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: checkout PR HEAD (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: setup go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: install hyperfine + jq + age + sops
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y hyperfine jq age
+          curl -sSfL -o /tmp/sops https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64
+          sudo install -m 0755 /tmp/sops /usr/local/bin/sops
+
+      - name: record SHAs
+        id: shas
+        run: |
+          echo "pr_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git fetch origin main --depth=1
+          echo "main_sha=$(git rev-parse origin/main)" >> "$GITHUB_OUTPUT"
+
+      - name: bench PR HEAD
+        run: bench/run.sh
+
+      - name: stash PR result
+        run: |
+          mkdir -p /tmp/bench-results
+          cp "bench/results/${{ steps.shas.outputs.pr_sha }}.json" /tmp/bench-results/
+
+      - name: checkout main
+        run: |
+          git checkout "${{ steps.shas.outputs.main_sha }}"
+
+      - name: bench main HEAD
+        run: |
+          # restore harness scripts from PR HEAD — main may not have them yet
+          git checkout "${{ steps.shas.outputs.pr_sha }}" -- bench/
+          bench/run.sh
+          cp "bench/results/${{ steps.shas.outputs.main_sha }}.json" /tmp/bench-results/
+
+      - name: restore PR HEAD + result files
+        run: |
+          git checkout "${{ steps.shas.outputs.pr_sha }}"
+          mkdir -p bench/results
+          cp /tmp/bench-results/*.json bench/results/
+
+      - name: compare
+        id: compare
+        run: |
+          bench/compare.sh \
+            "${{ steps.shas.outputs.main_sha }}" \
+            "${{ steps.shas.outputs.pr_sha }}" \
+            > /tmp/bench-comment.md
+          cat /tmp/bench-comment.md
+
+      - name: post PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/bench-comment.md
+
+      - name: upload result artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: /tmp/bench-results/*.json
+          retention-days: 30
