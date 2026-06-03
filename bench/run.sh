@@ -100,19 +100,31 @@ bench_toolchain() {
   echo "==> [$label] bench start (bin=$bin_path)" >&2
 
   # 1. Build time.
+  # NOTE: hyperfine and the fallback rebuild are both wrapped in `bash -c`
+  # subshells so a `cd zig && …` style build_cmd cannot leak its cwd into
+  # the rest of the bench (which would break e2e step that expects
+  # repo-root cwd).
   local build_json="$TMP/${label}-build.json"
   echo "    [$label] build time" >&2
-  hyperfine --warmup 3 --runs 10 \
+  if ! hyperfine --warmup 3 --runs 10 \
     --export-json "$build_json" \
     --prepare "rm -f '$bin_path'" \
-    "$build_cmd" >&2
+    "bash -c \"$build_cmd\"" >&2; then
+    echo "    [$label] build FAILED — skipping remaining metrics for $label" >&2
+    echo "null"
+    return 0
+  fi
 
   # Verify the artifact exists for the rest of the metrics.
   if [[ ! -x "$bin_path" ]]; then
     # rebuild once if the warmup loop happened to clean up the artifact.
-    eval "$build_cmd" >&2
+    ( eval "$build_cmd" ) >&2 || true
   fi
-  test -x "$bin_path"
+  if [[ ! -x "$bin_path" ]]; then
+    echo "    [$label] artifact missing after build — skipping" >&2
+    echo "null"
+    return 0
+  fi
 
   # 2. Binary size.
   local size_bytes
@@ -197,6 +209,11 @@ run_one() {
   local label="$1" bin="$2" build_cmd="$3"
   local out
   out="$(bench_toolchain "$label" "$bin" "$build_cmd")"
+  # Skip if the toolchain build failed (bench_toolchain emitted "null").
+  if [[ "$out" == "null" ]]; then
+    echo "==> [$label] omitted from results" >&2
+    return 0
+  fi
   jq --argjson new "$out" '. + [$new]' "$TOOLCHAINS_JSON" > "$TOOLCHAINS_JSON.tmp"
   mv "$TOOLCHAINS_JSON.tmp" "$TOOLCHAINS_JSON"
 }
@@ -238,42 +255,37 @@ echo "==> wrote $OUT_FILE"
 # --- append summary line to history.jsonl ------------------------------------------
 # bench/history.jsonl is the agent-friendly summary index: one line per run,
 # flat metrics keyed by `<toolchain>.<metric>`, consumed by the docs changelog.
-# The verbose per-SHA JSON above stays as the forensic source of truth.
+# The verbose per-SHA JSON above stays as the forensic source of truth — we
+# derive the summary FROM that file (not from the $TMP staging dir) so the
+# transform is debuggable and doesn't depend on tmpfiles that the EXIT trap
+# may have already touched.
 HISTORY_FILE="$SCRIPT_DIR/history.jsonl"
-jq -c \
-  --arg sha "$GIT_SHA" \
-  --arg short "$GIT_SHORT" \
-  --arg ts "$TIMESTAMP" \
-  --arg os "$OS_NAME" \
-  --arg arch "$ARCH_NAME" \
-  --arg go_v "$GO_VERSION" \
-  --argjson zig_v "$ZIG_VERSION" \
-  --arg hf_v "$HYPERFINE_VERSION" \
-  --slurpfile toolchains "$TOOLCHAINS_JSON" \
-  '{
-     schema_version: 1,
-     sha: $sha,
-     short: $short,
-     timestamp: $ts,
-     platform: { os: $os, arch: $arch },
-     toolchain_versions: { go: $go_v, zig: $zig_v, hyperfine: $hf_v },
-     metrics: (
-       $toolchains[0]
-       | map(
-           . as $t
-           | [
-               {key: ($t.label + ".build_time_sec"),    value: $t.build_time_sec.mean},
-               {key: ($t.label + ".cold_start_sec"),    value: $t.cold_start_sec.mean},
-               {key: ($t.label + ".list_latency_sec"),  value: $t.list_latency_sec.mean},
-               {key: ($t.label + ".exec_latency_sec"),  value: $t.exec_latency_sec.mean},
-               {key: ($t.label + ".binary_size_bytes"), value: $t.binary_size_bytes},
-               {key: ($t.label + ".peak_rss_bytes"),    value: $t.peak_rss_bytes},
-               {key: ($t.label + ".e2e_wallclock_sec"), value: $t.e2e_wallclock_sec}
-             ]
-         )
-       | add
-       | from_entries
-     )
-   }' >> "$HISTORY_FILE"
+jq -c '
+  {
+    schema_version: 1,
+    sha: .git_sha,
+    short: .git_short,
+    timestamp: .timestamp,
+    platform: .platform,
+    toolchain_versions: .toolchain_versions,
+    metrics: (
+      (.toolchains // [])
+      | map(
+          . as $t
+          | [
+              {key: ($t.label + ".build_time_sec"),    value: $t.build_time_sec.mean},
+              {key: ($t.label + ".cold_start_sec"),    value: $t.cold_start_sec.mean},
+              {key: ($t.label + ".list_latency_sec"),  value: $t.list_latency_sec.mean},
+              {key: ($t.label + ".exec_latency_sec"),  value: $t.exec_latency_sec.mean},
+              {key: ($t.label + ".binary_size_bytes"), value: $t.binary_size_bytes},
+              {key: ($t.label + ".peak_rss_bytes"),    value: $t.peak_rss_bytes},
+              {key: ($t.label + ".e2e_wallclock_sec"), value: $t.e2e_wallclock_sec}
+            ]
+        )
+      | (if length == 0 then [] else add end)
+      | from_entries
+    )
+  }
+' "$OUT_FILE" >> "$HISTORY_FILE"
 
 echo "==> appended summary to $HISTORY_FILE"

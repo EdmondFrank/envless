@@ -29,6 +29,21 @@ Both installed at project scope via:
 
 5. **rtk is not a skill.** Never appears in the skills list. Invoked only as a Bash prefix per the rules in `CLAUDE.md`.
 
+## Zig toolchain — macOS 26 Tahoe blocker
+
+The Zig codebase is pinned to **0.13.0** (`zig/.zigversion`). On macOS 26 (Tahoe) the 0.13.0 linker fails with `undefined symbol: _arc4random_buf`, `_exit`, `_posix_memalign`, etc. — Tahoe's SDK exposes a different libSystem ABI than 0.13.0 expects.
+
+What this means for local benchmarking:
+- `bash bench/run.sh` on macOS 26 will run the Go leg only. The Zig leg's build step fails inside `hyperfine`, the harness skips the Zig toolchain cleanly, and the verbose result JSON has `toolchains: [{go: ...}]` with no zig entry.
+- CI (`.github/workflows/ci-zig.yml`, `bench.yml`) uses Ubuntu runners where 0.13.0 links fine — Zig metrics will appear in CI artifacts.
+
+Workarounds (if you must benchmark Zig locally on macOS 26):
+1. Wait for Zig 0.14/0.15 macOS-26 fixes and port the codebase (stdlib churn: `std.fs.cwd`, `std.process.Child`).
+2. Use Linux (VM, Docker, remote runner).
+3. Downgrade macOS — not recommended.
+
+Don't "fix" the Tahoe linker error by sprinkling `-lc` or `--sysroot` hacks in `build.zig`. The codebase ports cleanly to 0.14; the right move when this becomes painful is to bump `.zigversion` to 0.14 and update the stdlib calls.
+
 ## Benchmark history storage
 
 Format: **JSONL** at `bench/history.jsonl` (one line = one bench run, keyed by `sha` + `timestamp`). Not SQLite, not per-SHA files-only.
