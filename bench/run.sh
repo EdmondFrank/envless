@@ -224,7 +224,8 @@ run_one "go" "$GO_BIN" "make build"
 
 # Zig binary, if present.
 if [[ "$HAS_ZIG" -eq 1 ]]; then
-  ZIG_BIN="$REPO_ROOT/zig-out/bin/envless"
+  # Zig's build root is the zig/ subdir, so the install prefix is zig/zig-out.
+  ZIG_BIN="$REPO_ROOT/zig/zig-out/bin/envless"
   run_one "zig" "$ZIG_BIN" "cd zig && zig build -Doptimize=ReleaseSmall"
 fi
 
