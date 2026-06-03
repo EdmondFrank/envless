@@ -9,6 +9,10 @@ hero:
       link: ./getting-started/install/
       icon: right-arrow
       variant: primary
+    - text: Latest v0.0.1
+      link: ./releases/latest/
+      icon: rocket
+      variant: secondary
     - text: GitHub
       link: https://github.com/biliboss/envless
       icon: external
@@ -40,6 +44,24 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
   </Card>
 </CardGrid>
 
+## Two audiences
+
+<CardGrid>
+  <Card title="For the CEO" icon="approve-check">
+    Why this exists, how it compares, what we will and won't build.
+    Start with [Positioning](./why/positioning/) and the
+    [comparison](./why/comparison/) against Vault / 1Password / Infisical.
+  </Card>
+  <Card title="For the CTO" icon="setting">
+    [Architecture](./concepts/architecture/),
+    [threat model](./security/threat-model/),
+    [CLI reference](./reference/cli/), and
+    [CI/CD patterns](./operations/cicd/).
+  </Card>
+</CardGrid>
+
 ## Status
 
-v0.0.1 — single-user core. Teams + plugins + skill in v0.1.
+v0.0.1 — single-user core. Teams + plugins + skill in v0.1. See the
+[roadmap](./why/roadmap/) for what comes next, and the
+[changelog](./releases/changelog/) for what shipped.

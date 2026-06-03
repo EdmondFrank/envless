@@ -1,0 +1,125 @@
+---
+import type { Release } from "../lib/releases.ts";
+import BenchDeltaTable from "./BenchDeltaTable.astro";
+import { marked } from "marked";
+import sanitizeHtml from "sanitize-html";
+
+interface Props {
+  release: Release;
+}
+
+const { release } = Astro.props;
+
+const dateStr = new Date(release.date).toISOString().slice(0, 10);
+
+// Render markdown body to HTML, then sanitize.
+const rawHtml = marked.parse(release.body || "", { async: false }) as string;
+const safeBody = sanitizeHtml(rawHtml, {
+  allowedTags: [
+    ...sanitizeHtml.defaults.allowedTags,
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "img",
+  ],
+  allowedAttributes: {
+    ...sanitizeHtml.defaults.allowedAttributes,
+    a: ["href", "name", "target", "rel"],
+    img: ["src", "alt", "title"],
+  },
+  transformTags: {
+    a: (tagName, attribs) => ({
+      tagName: "a",
+      attribs: { ...attribs, rel: "noopener noreferrer", target: "_blank" },
+    }),
+  },
+});
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
+}
+---
+
+<section
+  id={`release-${release.tag}`}
+  style="border: 1px solid var(--sl-color-gray-5, #374151); border-radius: 8px; padding: 1.25rem 1.5rem; margin: 1.5rem 0; background: var(--sl-color-bg-sidebar, transparent);"
+>
+  <header style="display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; margin-bottom: 0.5rem;">
+    <h2 style="margin: 0; font-size: 1.4rem;">
+      <a href={`#release-${release.tag}`} style="color: inherit; text-decoration: none;">
+        {release.name}
+      </a>
+    </h2>
+    <time
+      datetime={release.date}
+      style="font-family: var(--sl-font-mono); font-size: 0.9em; color: var(--sl-color-gray-3, #9ca3af);"
+    >
+      {dateStr}
+    </time>
+    <a
+      href={release.url}
+      rel="noopener noreferrer"
+      target="_blank"
+      style="margin-left: auto; font-size: 0.85em;"
+    >
+      GitHub release →
+    </a>
+  </header>
+
+  {release.sha && (
+    <p style="font-family: var(--sl-font-mono); font-size: 0.8em; color: var(--sl-color-gray-3, #9ca3af); margin: 0 0 0.75rem;">
+      commit <code>{release.sha.slice(0, 12)}</code>
+    </p>
+  )}
+
+  {release.body?.trim() ? (
+    <div class="release-body" set:html={safeBody}></div>
+  ) : (
+    <p style="font-style: italic; color: var(--sl-color-gray-3);">No release notes.</p>
+  )}
+
+  <h3 style="margin-top: 1.25rem; margin-bottom: 0.4rem; font-size: 1.05rem;">
+    Performance
+  </h3>
+  <BenchDeltaTable bench={release.bench} prev={release.benchPrev} />
+
+  {release.assets.length > 0 && (
+    <>
+      <h3 style="margin-top: 1.25rem; margin-bottom: 0.4rem; font-size: 1.05rem;">
+        Assets
+      </h3>
+      <ul style="list-style: none; padding: 0; margin: 0;">
+        {release.assets.map((a) => (
+          <li style="padding: 0.2rem 0; font-family: var(--sl-font-mono); font-size: 0.9em;">
+            <a href={a.browser_download_url} rel="noopener noreferrer" target="_blank">
+              {a.name}
+            </a>
+            <span style="color: var(--sl-color-gray-3, #9ca3af); margin-left: 0.5rem;">
+              {formatBytes(a.size)}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </>
+  )}
+</section>
+
+<style>
+  .release-body :global(p) {
+    margin: 0.5rem 0;
+  }
+  .release-body :global(ul),
+  .release-body :global(ol) {
+    margin: 0.5rem 0 0.5rem 1.25rem;
+  }
+  .release-body :global(code) {
+    font-family: var(--sl-font-mono);
+    background: var(--sl-color-gray-6, #1f2937);
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+    font-size: 0.92em;
+  }
+</style>

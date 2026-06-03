@@ -10,8 +10,13 @@
     "check": "astro check"
   },
   "dependencies": {
+    "@astrojs/mdx": "4.0.3",
     "@astrojs/starlight": "0.30.6",
     "astro": "5.1.5",
+    "mermaid": "11.4.1",
+    "marked": "15.0.4",
+    "sanitize-html": "2.13.1",
+    "unist-util-visit": "5.0.0",
     "sharp": "0.33.5"
   }
 }

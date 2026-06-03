@@ -1,0 +1,11 @@
+[
+  {
+    "tag_name": "v0.0.1",
+    "name": "v0.0.1 — single-user core",
+    "html_url": "https://github.com/biliboss/envless/releases/tag/v0.0.1",
+    "published_at": "2026-05-20T10:15:00Z",
+    "target_commitish": "585b8c1b9beabc83e6b30331575a5211ef04aafb",
+    "body": "First tagged release.\n\n- `envless init / set / get / list / exec / migrate`\n- age + sops shellouts, dotenv format on disk\n- e2e suite: 6 cases, all green\n\nNo binaries attached yet — build from source via `make build`.",
+    "assets": []
+  }
+]

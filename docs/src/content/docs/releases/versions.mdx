@@ -1,0 +1,51 @@
+---
+title: All versions
+description: Compact table of every envless release, sortable newest-first.
+---
+
+import { getReleases } from "../../../lib/releases.ts";
+
+export const releases = await getReleases();
+
+export const pickMetric = (bench, name) =>
+  bench && bench[name] ? `${bench[name].value} ${bench[name].unit}` : "—";
+
+A compact table of every release, newest first. Each row links to the
+detailed entry on the [Changelog](../changelog/).
+
+{releases.length === 0 ? (
+  <p><em>No releases have been published yet.</em></p>
+) : (
+  <table style="width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: 0.95em;">
+    <thead>
+      <tr style="border-bottom: 1px solid var(--sl-color-gray-5, #374151);">
+        <th style="text-align: left; padding: 0.4rem 0.6rem;">Version</th>
+        <th style="text-align: left; padding: 0.4rem 0.6rem;">Date</th>
+        <th style="text-align: right; padding: 0.4rem 0.6rem;">Binary size</th>
+        <th style="text-align: right; padding: 0.4rem 0.6rem;">Cold start</th>
+        <th style="text-align: right; padding: 0.4rem 0.6rem;">exec latency</th>
+      </tr>
+    </thead>
+    <tbody>
+      {releases.map((r) => (
+        <tr style="border-bottom: 1px solid var(--sl-color-gray-6, #1f2937);">
+          <td style="padding: 0.4rem 0.6rem; font-family: var(--sl-font-mono);">
+            <a href={`../changelog/#release-${r.tag}`}>{r.tag}</a>
+          </td>
+          <td style="padding: 0.4rem 0.6rem; font-family: var(--sl-font-mono); color: var(--sl-color-gray-3);">
+            {new Date(r.date).toISOString().slice(0, 10)}
+          </td>
+          <td style="padding: 0.4rem 0.6rem; text-align: right; font-variant-numeric: tabular-nums;">
+            {pickMetric(r.bench, "binary_size")}
+          </td>
+          <td style="padding: 0.4rem 0.6rem; text-align: right; font-variant-numeric: tabular-nums;">
+            {pickMetric(r.bench, "cold_start")}
+          </td>
+          <td style="padding: 0.4rem 0.6rem; text-align: right; font-variant-numeric: tabular-nums;">
+            {pickMetric(r.bench, "exec_latency")}
+          </td>
+        </tr>
+      ))}
+    </tbody>
+  </table>
+)}
