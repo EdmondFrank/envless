@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "git_sha": "66f5eae16b6645b20a782ccf8b2f3f2bd0570ba3",
+  "git_short": "66f5eae",
+  "timestamp": "2026-06-04T08:24:12Z",
+  "platform": {
+    "os": "Linux",
+    "arch": "aarch64"
+  },
+  "toolchain_versions": {
+    "zig": "0.13.0",
+    "hyperfine": "1.18.0"
+  },
+  "toolchains": [
+    {
+      "label": "zig",
+      "binary": "/work/zig/zig-out/bin/envless",
+      "binary_size_bytes": 143240,
+      "build_time_sec": {
+        "mean": 7.243223605380001,
+        "stddev": 1.9780069504472115,
+        "min": 5.67026158928,
+        "max": 12.42654423328,
+        "runs": 10
+      },
+      "cold_start_sec": {
+        "mean": 0.00045512324,
+        "stddev": 0.0002702824349945593,
+        "min": 0.0002079753,
+        "max": 0.0019412992999999997,
+        "runs": 50
+      },
+      "list_latency_sec": {
+        "mean": 0.00796942442,
+        "stddev": 0.0016362493780157064,
+        "min": 0.00551581762,
+        "max": 0.01162272162,
+        "runs": 30
+      },
+      "exec_latency_sec": {
+        "mean": 0.008587551966666666,
+        "stddev": 0.0024207184702149326,
+        "min": 0.0059138297000000005,
+        "max": 0.0182498777,
+        "runs": 30
+      },
+      "peak_rss_bytes": 30724096,
+      "e2e_wallclock_sec": 4.772
+    }
+  ]
+}
