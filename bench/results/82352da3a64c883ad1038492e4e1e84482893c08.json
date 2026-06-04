@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "git_sha": "82352da3a64c883ad1038492e4e1e84482893c08",
+  "git_short": "82352da",
+  "timestamp": "2026-06-03T23:59:34Z",
+  "platform": {
+    "os": "Linux",
+    "arch": "aarch64"
+  },
+  "toolchain_versions": {
+    "go": "go1.26.0",
+    "zig": "0.13.0",
+    "hyperfine": "1.20.0"
+  },
+  "toolchains": [
+    {
+      "label": "go",
+      "binary": "/repo/bin/envless",
+      "binary_size_bytes": 2752777,
+      "build_time_sec": {
+        "mean": 0.09485158426000001,
+        "stddev": 0.00258907698082503,
+        "min": 0.09115069576000001,
+        "max": 0.09884233876000001,
+        "runs": 10
+      },
+      "cold_start_sec": {
+        "mean": 0.0006534206400000001,
+        "stddev": 0.00015306970162012428,
+        "min": 0.00048402438000000005,
+        "max": 0.0012571053800000001,
+        "runs": 50
+      },
+      "list_latency_sec": {
+        "mean": 0.005600562886666666,
+        "stddev": 0.0012033354548509575,
+        "min": 0.00458092242,
+        "max": 0.010974570420000001,
+        "runs": 30
+      },
+      "exec_latency_sec": {
+        "mean": 0.005857126593333332,
+        "stddev": 0.0010644824368133245,
+        "min": 0.00468732196,
+        "max": 0.00983880596,
+        "runs": 30
+      },
+      "peak_rss_bytes": -1,
+      "e2e_wallclock_sec": 3.022
+    },
+    {
+      "label": "zig",
+      "binary": "/repo/zig/zig-out/bin/envless",
+      "binary_size_bytes": 143224,
+      "build_time_sec": {
+        "mean": 0.009752791020000002,
+        "stddev": 0.000795967809102437,
+        "min": 0.00904446402,
+        "max": 0.01184499802,
+        "runs": 10
+      },
+      "cold_start_sec": {
+        "mean": 0.00014685369999999993,
+        "stddev": 0.00007577895509927784,
+        "min": 0.00010083871999999995,
+        "max": 0.00063229572,
+        "runs": 50
+      },
+      "list_latency_sec": {
+        "mean": 0.004998083580000001,
+        "stddev": 0.0005628186343906185,
+        "min": 0.0039505712800000006,
+        "max": 0.00604944028,
+        "runs": 30
+      },
+      "exec_latency_sec": {
+        "mean": 0.006309576280000002,
+        "stddev": 0.0019066566166080709,
+        "min": 0.00442942318,
+        "max": 0.01225344218,
+        "runs": 30
+      },
+      "peak_rss_bytes": -1,
+      "e2e_wallclock_sec": 0.207
+    }
+  ]
+}
