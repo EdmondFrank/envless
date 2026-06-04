@@ -58,6 +58,27 @@ If you ever do port it, the entrypoint contract is:
 - Emit one verbose JSON to `bench/results/<sha>.json`
 - Append one summary line to `bench/history.jsonl`
 
+## Versioning policy (pre-1.0)
+
+Until the project ships `v1.0.0`, every release **bumps MINOR**.
+
+- Next release after `v0.0.2` is `v0.1.0`. Then `v0.2.0`, `v0.3.0`, ...
+- `v0.X.0` is the only "normal" release shape pre-1.0.
+- **PATCH (`v0.X.Y` with `Y > 0`)** is reserved for true hot-fixes — a
+  critical regression in an already-published release that needs to
+  ship within hours. Use sparingly. If you find yourself reaching for
+  `v0.X.1` for anything that can wait until the next MINOR, bump
+  MINOR instead.
+- **MAJOR (`v1.0.0`)** is set deliberately by the maintainer; do not
+  bump major automatically.
+- Pre-release suffixes (`-rc1`, `-beta`, etc) are honored by
+  `release.yml` and tagged as GitHub prereleases — fine for testing
+  the pipeline without polluting the changelog.
+
+Operationally: `git tag v0.X.0 && git push origin v0.X.0` is the
+canonical release path. CI does the rest (build → publish → bump
+brew formula → commit).
+
 ## Benchmark history storage
 
 Format: **JSONL** at `bench/history.jsonl` (one line = one bench run, keyed by `sha` + `timestamp`). Not SQLite, not per-SHA files-only.
