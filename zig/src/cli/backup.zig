@@ -38,6 +38,11 @@ const IDENTITY_WARNING =
     "Continue? [y/N]\n";
 
 pub fn run(ctx: *root.Context, args: []const []const u8) !u8 {
+    if (root.wantsHelp(args)) {
+        try printHelp(ctx);
+        return 0;
+    }
+
     // Pop --output.
     var after_output = std.ArrayList([]const u8).init(ctx.allocator);
     defer after_output.deinit();
@@ -145,4 +150,52 @@ fn readYes(ctx: *root.Context) !bool {
     if (r == 0) return false;
     const line = std.mem.trim(u8, buf[0..r], " \t\r\n");
     return std.mem.eql(u8, line, "y") or std.mem.eql(u8, line, "Y");
+}
+
+fn printHelp(ctx: *root.Context) !void {
+    const w = ctx.stdout.writer();
+    const s = root.Style.fromFile(ctx.stdout);
+    const b = s.bold();
+    const d = s.dim();
+    const r = s.reset();
+
+    try w.print("envless backup {s}— emit tar.gz of encrypted artefacts (identity excluded){s}\n\n", .{ d, r });
+
+    try w.print("{s}Usage:{s}\n", .{ b, r });
+    try w.writeAll("  envless backup [--output PATH] [--include-identity] [--yes]\n\n");
+
+    try w.print("{s}Description:{s}\n", .{ b, r });
+    try w.writeAll("  Bundles .envless/recipients + secrets/*.env.enc + MANIFEST.json into\n");
+    try w.writeAll("  a single tar.gz. The age secret key (.envless/identity.key) is\n");
+    try w.writeAll("  EXCLUDED by default so the resulting tarball is safe to upload to\n");
+    try w.writeAll("  any storage destination. --include-identity opts in to including\n");
+    try w.writeAll("  the secret key; requires interactive confirmation, or --yes in a\n");
+    try w.writeAll("  non-TTY context.\n\n");
+    try w.writeAll("  envless backup walks up from cwd looking for .envless/identity.key\n");
+    try w.writeAll("  to resolve the repo root, so it works from any subdirectory.\n\n");
+
+    try w.print("{s}Flags:{s}\n", .{ b, r });
+    try w.writeAll("  --output PATH         write tarball to PATH ('-' or omitted = stdout)\n");
+    try w.writeAll("  --include-identity    also include .envless/identity.key (DANGER)\n");
+    try w.writeAll("  --yes                 bypass interactive confirm (required in non-TTY)\n");
+    try w.writeAll("  -h, --help            show this help\n\n");
+
+    try w.print("{s}Examples:{s}\n", .{ b, r });
+    try w.print("  {s}# Safe default — recipients + encrypted envs + manifest{s}\n", .{ d, r });
+    try w.writeAll("  envless backup --output backup-$(date -u +%Y%m%d).tar.gz\n\n");
+    try w.print("  {s}# Stream to a cloud sync without a local tempfile{s}\n", .{ d, r });
+    try w.writeAll("  envless backup | rclone rcat gdrive:envless-backups/$(date -u +%Y%m%d).tar.gz\n\n");
+    try w.print("  {s}# Identity-included backup, GPG-wrapped before any storage{s}\n", .{ d, r });
+    try w.writeAll("  envless backup --include-identity --yes --output - \\\n");
+    try w.writeAll("    | gpg --symmetric --cipher-algo AES256 --output backup.tar.gz.gpg\n\n");
+
+    try w.print("{s}Exit codes:{s}\n", .{ b, r });
+    try w.writeAll("  0    success\n");
+    try w.writeAll("  1    user cancelled the --include-identity prompt\n");
+    try w.writeAll("  2    usage error (e.g. --include-identity without --yes in non-TTY)\n");
+    try w.writeAll("  64   no .envless/identity.key found in cwd or any parent\n");
+    try w.writeAll("  74   IO / tar / manifest error\n\n");
+
+    try w.print("{s}See also:{s}\n", .{ b, r });
+    try w.writeAll("  Operations → Backup & restore — https://biliboss.github.io/envless/operations/#backup--restore\n");
 }
