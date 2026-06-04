@@ -77,7 +77,14 @@ secrets manager.
 
 - **A running process inspected via `ptrace`, `/proc/<pid>/environ`,
   or memory dump.** Once a secret is loaded into the child's env, the
-  child's memory is fair game.
+  child's memory is fair game. The optional [`envless daemon`](/envless/cli/#envless-daemon)
+  widens this window: when installed, decrypted env stays in the
+  daemon process's heap for up to 60 seconds per `(repo, env)` pair,
+  so a ptrace-capable attacker has a longer reach. Daemon mode is an
+  **explicit opt-in** (`envless daemon install`) — the default install
+  has no daemon and no resident plaintext outside the lifetime of a
+  single `sops decrypt`. See [Operations → Daemon mode](/envless/operations/#daemon-mode)
+  for the tradeoff in full.
 - **A malicious recipient.** Adding a pubkey to `.envless/recipients`
   grants permanent access to every encrypted file from that point on.
   Revoking the pubkey only stops *future* encryptions from being

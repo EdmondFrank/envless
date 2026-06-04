@@ -3,7 +3,7 @@ title: CLI reference
 description: Every subcommand, every flag, every exit code, every file format envless touches, and every environment variable it reads or sets. The single source of truth.
 ---
 
-`envless` has six subcommands plus a root version flag. The surface
+`envless` has eight subcommands plus a root version flag. The surface
 is deliberately flat — no nested groups, no hidden commands.
 
 ```
@@ -15,6 +15,8 @@ envless get    KEY                        [--env=ENV] --confirm
 envless list                              [--env=ENV]
 envless exec                              [--env=ENV] -- CMD [ARGS...]
 envless migrate FILE                      [--env=ENV] [--keep]
+envless mcp                                                          # JSON-RPC 2.0 stdio MCP server
+envless daemon [install|uninstall|status|stop]                       # optional decrypt-cache daemon
 ```
 
 Default for `--env` is always `dev`.
@@ -162,6 +164,108 @@ Output (without `--keep`):
 MIGRATE  src=.env env=dev keys=3
 REMOVE   .env
 ```
+
+### `envless mcp`
+
+Run the [Model Context Protocol](https://modelcontextprotocol.io) server
+on stdio. Reads JSON-RPC 2.0 lines from stdin (newline-delimited, no LSP
+`Content-Length` framing — that's the MCP stdio convention) and writes
+responses to stdout. No flags in v1.
+
+Protocol: MCP `2024-11-05`, **tools-only**. Eight tools, all using
+draft-7 JSON Schema:
+
+| Tool | Input | Output | Notes |
+|---|---|---|---|
+| `envs` | `{}` | `{envs: ["dev", "prod"]}` | Scans `secrets/*.env.enc`. |
+| `list` | `{env}` | `{keys: ["FOO", "BAR"]}` | Sorted, no values. |
+| `get` | `{env, key, confirm:true}` | `{value: "..."}` | `confirm` must be exactly `true` (bool) or `"true"` (string). Anything else is rejected. |
+| `set` | `{env, key, value}` | `{ok: true}` | Encrypt-set one key. |
+| `exec` | `{env, argv, stdin?, cwd?}` | `{exit_code, stdout, stderr}` | Hard 300s timeout. Captures stdout+stderr in memory; cap 16 MiB each. |
+| `init` | `{path?}` | `{pubkey: "age1..."}` | Defaults `path` to MCP server cwd. |
+| `migrate` | `{file, env, keep?}` | `{count: N}` | Same semantics as the `migrate` subcommand. |
+| `whoami` | `{}` | `{pubkey, recipients: N}` | Reads `.envless/identity.key` and `.envless/recipients`. |
+
+Tool-level errors come back as `{content:[{type:"text",text:"..."}],
+isError:true}` per the MCP convention — **not** as JSON-RPC errors. The
+JSON-RPC error codes (`-32700` parse, `-32600` invalid request,
+`-32601` method not found, `-32602` invalid params, `-32603` internal)
+are reserved for protocol-level issues.
+
+Stateless model: every `tools/call` is independent — no session state,
+no in-memory cache between calls. When the [daemon](#envless-daemon)
+socket exists at `$XDG_RUNTIME_DIR/envless/sock` (or
+`$HOME/.cache/envless/sock`) and answers `PING` within ~100ms, calls
+route through it for low-latency repeated reads. Otherwise the MCP
+process spawns `sops` fresh on each call, identical to the CLI path.
+
+Example session (one request per line, one response per line):
+
+```
+$ envless mcp
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"claude","version":"1"}}}
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"envless","version":"v0.1.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+{"jsonrpc":"2.0","id":2,"result":{"tools":[...8 entries...]}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"envs","arguments":{}}}
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"envs\":[\"dev\",\"prod\"]}"}],"isError":false}}
+```
+
+Wiring envless MCP into Claude Code / Codex / Cursor / Cline is
+covered on the [Agents (MCP)](/envless/agents/) page.
+
+### `envless daemon`
+
+Run the optional decrypt-cache daemon. **Not auto-started**: you opt in
+by running `envless daemon install`. This is intentional — the daemon
+holds decrypted env in memory for up to 60s and is documented under the
+ptrace tier in [Security](/envless/security/).
+
+```
+envless daemon                # foreground (for launchd/systemd to manage)
+envless daemon install        # install LaunchAgent (macOS) or user unit (Linux)
+envless daemon uninstall      # remove + bootout/disable
+envless daemon status         # supervisor + socket probe
+envless daemon stop           # send SIGTERM via launchctl/systemctl
+```
+
+Wire protocol: TAB-separated lines over a UNIX stream socket at
+`$XDG_RUNTIME_DIR/envless/sock` (preferred) or `$HOME/.cache/envless/sock`.
+
+```
+PING\n                                        → OK\t{}\n
+WHOAMI\n                                      → OK\t{"pubkey":"age1...","recipients":3}\n
+LIST\t<env>\n                                 → OK\t{"keys":[...]}\n
+GET\t<env>\t<key>\n                           → OK\t{"value":"..."}\n
+SET\t<env>\t<key>\t<value>\n                  → OK\t{"ok":true}\n
+EXEC\t<env>\t<cwd>\t<argv-b64>\t<stdin-b64>\t<timeout-ms>\n → OK\t{"exit_code":N,...}\n
+```
+
+Error responses use `ERR\t{"code":"...","message":"..."}\n`. `argv-b64`
+is base64(JSON-array-of-strings) so embedded TABs/newlines round-trip.
+
+Cache:
+
+- Keyed by `(repo_root, env)`.
+- Invalidated on file mtime change (so an out-of-band `envless set`
+  is observed cleanly).
+- TTL 60s.
+- LRU bounded to 32 entries.
+- Best-effort `secureZero` of value bytes before free on shutdown.
+
+Supervisor integration:
+
+- **macOS** — writes `~/Library/LaunchAgents/io.github.biliboss.envless.plist`
+  and runs `launchctl bootstrap gui/$UID …`. KeepAlive uses
+  `SuccessfulExit=false` so a clean exit stays down.
+- **Linux** — writes `~/.config/systemd/user/envless.service` (or
+  `$XDG_CONFIG_HOME/systemd/user/`), runs `systemctl --user
+  daemon-reload && systemctl --user enable --now envless`.
+
+Override the label/unit name via `ENVLESS_LAUNCHD_LABEL` /
+`ENVLESS_SYSTEMD_UNIT` (used by tests so a CI bootstrap doesn't fight a
+developer's real install).
 
 ## Exit codes
 
@@ -444,6 +548,8 @@ parser deliberately small; richer parsing lands in v0.1.
 | `list` | [`zig/src/cli/list.zig`][gh-list] |
 | `exec` | [`zig/src/cli/exec.zig`][gh-exec] |
 | `migrate` | [`zig/src/cli/migrate.zig`][gh-migrate] |
+| `mcp` | [`zig/src/cli/mcp.zig`](https://github.com/biliboss/envless/blob/main/zig/src/cli/mcp.zig), [`zig/src/mcp.zig`](https://github.com/biliboss/envless/blob/main/zig/src/mcp.zig) |
+| `daemon` | [`zig/src/cli/daemon.zig`](https://github.com/biliboss/envless/blob/main/zig/src/cli/daemon.zig), [`zig/src/daemon.zig`](https://github.com/biliboss/envless/blob/main/zig/src/daemon.zig), [`zig/src/ipc.zig`](https://github.com/biliboss/envless/blob/main/zig/src/ipc.zig), [`zig/src/launchd.zig`](https://github.com/biliboss/envless/blob/main/zig/src/launchd.zig), [`zig/src/systemd.zig`](https://github.com/biliboss/envless/blob/main/zig/src/systemd.zig) |
 | root wiring | [`zig/src/cli/root.zig`][gh-root] |
 
 [age]: https://age-encryption.org/v1

@@ -409,5 +409,76 @@ Build with `docker build --secret id=age_identity,src=$HOME/.config/envless/ci.k
 
 Until then, the snippets above are the supported pattern.
 
+## Daemon mode
+
+`envless daemon` is an **opt-in** UNIX-socket service that caches
+decrypted env in memory so repeated reads do not re-spawn `sops`. The
+target use case is an agent loop (Claude Code, Cursor, etc.) that calls
+`envless` dozens of times per minute — without the daemon, each call
+pays the sops cold-start tax (~80-150ms); with it, lookups are
+sub-millisecond after the first decrypt.
+
+### Tradeoff
+
+The daemon holds plaintext secrets in process memory for up to 60s per
+`(repo, env)` pair. A local attacker with `ptrace` privileges (root, or
+on macOS the user themselves) can read that memory. The CLI's
+default path, by contrast, holds plaintext only for the lifetime of one
+`sops decrypt` call — usually under 100ms.
+
+If your threat model treats the local user as trusted (your laptop, no
+shared accounts, full-disk encryption), the daemon is fine. If
+multiple humans share an account, or if untrusted processes might run
+under your UID, leave it off and pay the per-call cost.
+
+The full threat model is in [Security](/envless/security/) under the
+"Local attacker (ptrace tier)" bullet.
+
+### Installing
+
+```bash
+# macOS — installs a LaunchAgent at ~/Library/LaunchAgents/.
+envless daemon install
+
+# Linux — installs a user systemd unit at ~/.config/systemd/user/.
+envless daemon install
+```
+
+Both paths run the daemon under your user account (not root) and start
+it immediately. Status:
+
+```bash
+envless daemon status
+# [envless daemon] socket: /run/user/1000/envless/sock (present)
+# [launchd] plist: /Users/you/Library/LaunchAgents/io.github.biliboss.envless.plist (present)
+# [launchd] launchctl print OK …
+```
+
+### Uninstalling
+
+```bash
+envless daemon uninstall
+```
+
+This boots the service out (macOS) or disables the unit (Linux) and
+deletes the plist/unit file. The socket is removed on next daemon
+shutdown.
+
+### Running in the foreground
+
+For ad-hoc debugging or running the daemon under a different process
+manager (tmux, foreman, …), invoke `envless daemon` with no
+sub-argument. The process logs to stderr and exits cleanly on
+SIGTERM/SIGINT.
+
+### Wire-protocol consumers
+
+- `envless mcp` auto-detects the socket on every tools/call and routes
+  reads through it when present. No flag needed.
+- The plain CLI (`envless list`, `envless set`, etc.) does **NOT**
+  consult the daemon. CLI invocations are one-shot — the sops cost is
+  amortised across `&&`-chained calls, so the latency win is too small
+  to justify the security tradeoff.
+
 [age]: https://age-encryption.org/v1
 [gh-store]: https://github.com/biliboss/envless/blob/main/zig/src/store.zig
