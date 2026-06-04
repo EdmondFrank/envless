@@ -409,5 +409,308 @@ Build with `docker build --secret id=age_identity,src=$HOME/.config/envless/ci.k
 
 Until then, the snippets above are the supported pattern.
 
+## Backup & restore
+
+`envless` keeps its state in plain files under the repo
+(`.envless/recipients`, `secrets/*.env.enc`) plus one secret on disk
+(`.envless/identity.key`). The committed files ride along with your
+normal Git backups; the identity key needs a different home. The
+`envless backup` subcommand bundles the safe-to-share pieces into a
+single tar.gz and refuses, by default, to include the identity key.
+
+### What to back up
+
+- **`.envless/recipients`** — plaintext age public keys. Safe to back
+  up anywhere. It is already in Git.
+- **`secrets/*.env.enc`** — sops-encrypted ciphertext. Useless to an
+  attacker without a matching age secret key. Safe in any backup
+  destination. Already in Git.
+- **`.envless/identity.key`** — the age secret key. **Treat it like a
+  password**: anyone who reads this file can decrypt every secret you
+  have access to. It is gitignored by default and should never enter a
+  cloud sync you do not control end-to-end.
+
+The first two are encrypted-or-public artefacts: putting them in a
+public S3 bucket is unwise (it advertises the layout of your secrets)
+but cryptographically harmless. The third is a credential.
+
+### `envless backup` — the safe default
+
+```bash
+# Bundle .envless/recipients + secrets/*.env.enc + a MANIFEST.json
+# into a tarball you can ship anywhere.
+envless backup --output backup-$(date -u +%Y%m%d).tar.gz
+```
+
+Output (on stderr — stdout is reserved for streaming the tarball when
+no `--output` is given):
+
+```
+BACKUP  out=backup-20260604.tar.gz identity=excluded
+```
+
+The tarball contains:
+
+```
+MANIFEST.json              # archive metadata (see schema below)
+.envless/recipients        # the public-key access list
+secrets/dev.env.enc        # every encrypted env, one file each
+secrets/prod.env.enc
+```
+
+The identity key is **not** included. Restoring this tarball on a new
+machine gets you the encrypted artefacts; you still need an age key
+with read access to actually decrypt anything.
+
+`envless backup` resolves the repo root by walking up from the
+current directory looking for `.envless/identity.key`, so it works
+from anywhere inside the repo. If no `.envless/` is found, it exits
+with code `64` (configuration error).
+
+#### Streaming to stdout
+
+Omit `--output` (or pass `--output -`) and the tarball is written to
+stdout. This composes cleanly with cloud-upload CLIs:
+
+```bash
+envless backup | rclone rcat gdrive:envless-backups/$(date -u +%Y%m%d).tar.gz
+envless backup | aws s3 cp - s3://my-bucket/envless-$(date -u +%Y%m%d).tar.gz
+envless backup | gpg --symmetric --cipher-algo AES256 > backup.tar.gz.gpg
+```
+
+#### Manifest schema
+
+The `MANIFEST.json` member documents the archive:
+
+```json
+{
+  "schema_version": 1,
+  "envless_version": "v0.1.0",
+  "created_at": "2026-06-04T12:34:56Z",
+  "repo_root": "/Users/alice/my-app",
+  "pubkey": "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p",
+  "includes_identity": false,
+  "envs": ["dev", "prod"],
+  "file_count": 4
+}
+```
+
+- `schema_version`: integer. Bumped on breaking changes.
+- `envless_version`: the binary that wrote the tarball.
+- `created_at`: UTC, ISO 8601, second precision.
+- `repo_root`: absolute path on the host that created the backup —
+  for diagnostics; does not affect restore.
+- `pubkey`: the local identity's age pubkey. Useful for verifying
+  that the right recipient list shipped.
+- `includes_identity`: whether `.envless/identity.key` is in the
+  tarball. The CLI sets this from the `--include-identity` flag.
+- `envs`: lexicographically sorted env names found under `secrets/`.
+- `file_count`: total members in the tarball, including the manifest
+  itself.
+
+### Upload destinations (safe tarball)
+
+For the default tarball — the one with `includes_identity: false` —
+any of the following is acceptable.
+
+#### Google Drive via MCP
+
+If you wire the [`@modelcontextprotocol/server-gdrive`][mcp-gdrive]
+MCP server into your agent client, you get one-shot uploads. Example
+workflow snippet:
+
+```bash
+# Produce the tarball, copy to a scratch path, then ask the agent to
+# upload it. The agent does the gdrive API call via the MCP tool.
+envless backup --output /tmp/envless-$(date -u +%Y%m%d).tar.gz
+```
+
+Then in your agent:
+
+> Upload `/tmp/envless-20260604.tar.gz` to my "Envless Backups" folder
+> on Google Drive using the gdrive MCP tool.
+
+The agent calls the `gdrive.upload_file` tool; the file lands in
+Drive. The tarball contains only encrypted artefacts, so a Drive leak
+is bounded by the cryptographic strength of age + sops.
+
+#### rclone (any cloud)
+
+[rclone] is the lingua franca of cloud sync. One remote per provider,
+one `rcat` invocation per backup:
+
+```bash
+# One-time: configure a "gdrive" remote.
+rclone config
+
+# Daily backup, streamed straight into Drive — no local tempfile.
+envless backup | rclone rcat gdrive:envless-backups/$(date -u +%Y%m%d).tar.gz
+```
+
+Swap `gdrive:` for `s3:`, `b2:`, `azureblob:`, etc., per the rclone
+[backends list][rclone-backends].
+
+#### restic
+
+[restic] adds deduplication, encryption, and snapshot management on
+top of any storage backend. Best fit if you back up *many* repos.
+
+```bash
+restic -r s3:s3.amazonaws.com/my-restic-repo init   # one time
+envless backup --output /tmp/envless.tar.gz
+restic -r s3:s3.amazonaws.com/my-restic-repo backup /tmp/envless.tar.gz
+rm /tmp/envless.tar.gz
+```
+
+Restic's own at-rest encryption means even an S3-bucket leak does not
+expose your tarball; it is defense-in-depth on top of envless's
+encrypted artefacts.
+
+#### Git LFS (small teams)
+
+For three-person teams without external object storage, [Git LFS] in
+a private repo is fine:
+
+```bash
+git lfs install
+git lfs track "envless-backups/*.tar.gz"
+git add .gitattributes
+envless backup --output envless-backups/$(date -u +%Y%m%d).tar.gz
+git add envless-backups/ && git commit -m "envless backup" && git push
+```
+
+This is the lowest-friction option but only works if your Git host
+gives you enough LFS bandwidth/quota.
+
+### Identity key backup (separate workflow)
+
+The identity key is what makes the encrypted artefacts useful. Losing
+it is one of the disaster-recovery scenarios above. Backing it up
+**safely** is its own discipline.
+
+:::caution
+`envless backup --include-identity` writes the age secret key into
+the tarball. Anyone who obtains the resulting file can decrypt every
+secret you have access to. **Never upload that tarball to plain
+cloud sync** (Google Drive without MCP-style folder isolation,
+iCloud, Dropbox), email, or chat.
+:::
+
+#### Acceptable destinations
+
+- **Password manager attachment.** 1Password / Bitwarden / `pass` —
+  one item per identity, with the tarball or just the `identity.key`
+  itself as the attachment.
+- **GPG-encrypted file** uploaded anywhere. The GPG layer is what
+  makes the destination irrelevant.
+- **Encrypted local backup** sitting on an FDE'd volume (FileVault,
+  LUKS, BitLocker).
+
+#### Unacceptable destinations
+
+- Plain Google Drive / iCloud Drive / Dropbox.
+- Email or Slack / Teams / Discord attachments.
+- Unencrypted external drives.
+- A second laptop without FDE.
+
+#### Producing an identity-included backup
+
+```bash
+# Interactive: prompts for confirmation after printing a warning.
+envless backup --include-identity --output backup-with-key.tar.gz
+
+# Non-interactive (script / cron): requires explicit --yes.
+envless backup --include-identity --yes --output backup-with-key.tar.gz
+```
+
+Without `--yes`, a non-TTY run exits with code `2` and a message
+telling you to pass `--yes` if you really mean it. This is the
+guard-rail against accidentally including the key in an automated
+pipeline.
+
+#### Recommended: GPG-wrap before upload
+
+The cleanest pattern for backing up the identity is to stream the
+tarball through GPG symmetric encryption and only ever store the
+encrypted output:
+
+```bash
+envless backup --include-identity --yes --output - \
+  | gpg --symmetric --cipher-algo AES256 \
+        --output backup-$(date -u +%Y%m%d).tar.gz.gpg
+
+# Restore (interactive — gpg will prompt for the passphrase).
+gpg --decrypt backup-20260604.tar.gz.gpg | tar -xz -C /target/repo
+```
+
+The passphrase lives in your password manager. The `.tar.gz.gpg` file
+can ride along on any cloud — it is opaque without the passphrase.
+
+### Restore
+
+A backup is just a tarball; restore is just `tar -x`.
+
+```bash
+# Untar into the repo root (or a fresh checkout).
+tar -xzf backup-20260604.tar.gz -C /path/to/repo
+
+# Verify the manifest first if you want.
+tar -xzOf backup-20260604.tar.gz MANIFEST.json | jq .
+```
+
+If `MANIFEST.json` reports `"includes_identity": false`, the restore
+gives you back the encrypted artefacts only — you still need an age
+identity with read access to actually decrypt. This is the right
+shape for "back up the repo state without leaking key material."
+
+If the manifest reports `"includes_identity": true`, the restore puts
+the age secret key back at `.envless/identity.key`. Chmod it to 0600
+after restoring (Git doesn't track Unix modes; `tar` will preserve
+modes only if your tar honoured them on extract):
+
+```bash
+chmod 0600 .envless/identity.key
+```
+
+### Scheduled backup recipes
+
+For daily snapshots, wrap `envless backup` in a cron job or systemd
+timer.
+
+#### Plain cron
+
+```cron
+# Daily UTC backup with date-stamped filename. Keeps everything;
+# pair with a `find -mtime +30 -delete` if you want rotation.
+0 3 * * * cd /path/to/repo && envless backup \
+            --output /backups/envless-$(date -u +\%Y\%m\%d).tar.gz
+```
+
+#### cron + rclone (off-host)
+
+```cron
+0 3 * * * cd /path/to/repo && envless backup \
+            | rclone rcat gdrive:envless-backups/$(date -u +\%Y\%m\%d).tar.gz
+```
+
+#### Agent / MCP-driven schedule
+
+If your agent client supports scheduled jobs (Claude Code's `schedule`
+skill, Cursor's task runner, etc.), the recipe is two steps:
+
+1. Run `envless backup --output /tmp/envless-$(date -u +%Y%m%d).tar.gz`.
+2. Call the Google Drive MCP `upload_file` tool with the tarball path
+   and your target folder.
+
+The agent transcript becomes the audit trail. Restrict the MCP
+server's folder scope so a misconfigured upload can't land in a
+shared drive.
+
+[mcp-gdrive]: https://github.com/modelcontextprotocol/servers/tree/main/src/gdrive
+[rclone]: https://rclone.org/
+[rclone-backends]: https://rclone.org/overview/
+[restic]: https://restic.net/
+[Git LFS]: https://git-lfs.com/
+
 [age]: https://age-encryption.org/v1
 [gh-store]: https://github.com/biliboss/envless/blob/main/zig/src/store.zig
