@@ -6,6 +6,11 @@ const envparse = @import("../envparse.zig");
 const root = @import("root.zig");
 
 pub fn run(ctx: *root.Context, args: []const []const u8) !u8 {
+    if (root.wantsHelp(args)) {
+        try printHelp(ctx);
+        return 0;
+    }
+
     // Pop --env first.
     var after_env = std.ArrayList([]const u8).init(ctx.allocator);
     defer after_env.deinit();
@@ -19,7 +24,8 @@ pub fn run(ctx: *root.Context, args: []const []const u8) !u8 {
 
     if (rest.items.len != 1) {
         try ctx.stderr.writer().writeAll("envless: migrate requires exactly one FILE argument\n");
-        return 1;
+        try ctx.stderr.writer().writeAll("Run `envless migrate -h` for help.\n");
+        return 2;
     }
     const src = rest.items[0];
 
@@ -79,6 +85,48 @@ pub fn run(ctx: *root.Context, args: []const []const u8) !u8 {
         try ctx.stdout.writer().print("REMOVE   {s}\n", .{src});
     }
     return 0;
+}
+
+fn printHelp(ctx: *root.Context) !void {
+    const w = ctx.stdout.writer();
+    const s = root.Style.fromFile(ctx.stdout);
+    const b = s.bold();
+    const d = s.dim();
+    const r = s.reset();
+
+    try w.print("envless migrate {s}— encrypt a .env file into envless{s}\n\n", .{ d, r });
+
+    try w.print("{s}Usage:{s}\n", .{ b, r });
+    try w.writeAll("  envless migrate FILE [--env=NAME] [--keep]\n\n");
+
+    try w.print("{s}Description:{s}\n", .{ b, r });
+    try w.writeAll("  Parses FILE as dotenv syntax, merges every KEY=VALUE into\n");
+    try w.writeAll("  secrets/<env>.env.enc (existing keys are overwritten), adds the\n");
+    try w.writeAll("  file's basename to .gitignore, and then deletes the plaintext\n");
+    try w.writeAll("  source. Pass --keep to retain the original file for verification.\n\n");
+
+    try w.print("{s}Flags:{s}\n", .{ b, r });
+    try w.writeAll("  --env=NAME      environment to write into (default: dev)\n");
+    try w.writeAll("  --keep          do not delete the plaintext source after import\n");
+    try w.writeAll("  -h, --help      show this help\n\n");
+
+    try w.print("{s}Examples:{s}\n", .{ b, r });
+    try w.print("  {s}# One-shot migration: import .env into dev and delete the source{s}\n", .{ d, r });
+    try w.writeAll("  envless migrate .env\n\n");
+    try w.print("  {s}# Migrate a staging-specific dotenv but keep the plaintext to verify{s}\n", .{ d, r });
+    try w.writeAll("  envless migrate .env.staging --env=staging --keep\n\n");
+
+    try w.print("{s}Exit codes:{s}\n", .{ b, r });
+    try w.writeAll("  0    keys imported, .gitignore updated, plaintext removed (unless --keep)\n");
+    try w.writeAll("  1    parse error, sops failure, or filesystem error\n");
+    try w.writeAll("  2    usage error (missing FILE, bad flag)\n");
+    try w.writeAll("  64   no .envless/ found\n");
+    try w.writeAll("  74   could not delete the plaintext source\n\n");
+
+    try w.print("{s}See also:{s}\n", .{ b, r });
+    try w.writeAll("  envless set       set individual keys without bulk-importing\n");
+    try w.writeAll("  envless list      verify the imported key set\n");
+    try w.writeAll("  Docs:             https://biliboss.github.io/envless/cli/#envless-migrate-file\n");
 }
 
 /// appendGitignore: idempotent — only appends `pattern\n` if it's not already
