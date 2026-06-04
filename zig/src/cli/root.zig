@@ -34,6 +34,7 @@ const exec_cmd = @import("exec.zig");
 const migrate_cmd = @import("migrate.zig");
 const mcp_cmd = @import("mcp.zig");
 const daemon_cmd = @import("daemon.zig");
+const backup_cmd = @import("backup.zig");
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -89,6 +90,7 @@ pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, version: []co
     if (std.mem.eql(u8, sub, "migrate")) return migrate_cmd.run(&ctx, rest);
     if (std.mem.eql(u8, sub, "mcp")) return mcp_cmd.run(&ctx, rest);
     if (std.mem.eql(u8, sub, "daemon")) return daemon_cmd.run(&ctx, rest);
+    if (std.mem.eql(u8, sub, "backup")) return backup_cmd.run(&ctx, rest);
 
     try ctx.stderr.writer().print("envless: unknown command: {s}\n", .{sub});
     try ctx.stderr.writer().writeAll("Run `envless -h` for the list of commands.\n");

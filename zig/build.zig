@@ -56,6 +56,7 @@ pub fn build(b: *std.Build) void {
         "src/execenv.zig",
         "src/sops.zig",
         "src/store.zig",
+        "src/backup.zig",
         "src/cli/root.zig",
         "src/cli/migrate.zig",
         "src/ipc.zig",

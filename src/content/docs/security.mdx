@@ -426,6 +426,16 @@ this as a copy-paste-and-tick list.
       a code-reviewed PR.
 - [ ] **The encrypted `secrets/*.env.enc` files live in Git** and are
       backed up by your normal Git workflow. No second backup needed.
+- [ ] **For out-of-Git backups, prefer `envless backup`** — it
+      bundles `.envless/recipients` + `secrets/*.env.enc` + a
+      manifest into a tar.gz and **excludes `identity.key` by
+      default**. Identity inclusion is gated behind an interactive
+      prompt (or `--yes` for scripts) and a multi-line stderr
+      warning. See [Operations → Backup &
+      restore](/envless/operations/#backup--restore) for upload
+      destinations (rclone / restic / Google Drive via MCP), the
+      GPG-wrap pattern for the identity key, and scheduled-backup
+      recipes.
 
 ### Audit cadence
 

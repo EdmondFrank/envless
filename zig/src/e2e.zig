@@ -738,3 +738,212 @@ test "TestE2E_DaemonPingAndList" {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Backup e2e tests
+// ---------------------------------------------------------------------------
+
+/// Capture `tar -tzf <path>` member list as one big string. Caller owns.
+fn tarMembers(allocator: std.mem.Allocator, tar_path: []const u8) ![]u8 {
+    var child = std.process.Child.init(&.{ "tar", "-tzf", tar_path }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+    var out_buf = std.ArrayList(u8).init(allocator);
+    errdefer out_buf.deinit();
+    var err_buf = std.ArrayList(u8).init(allocator);
+    defer err_buf.deinit();
+    try child.collectOutput(&out_buf, &err_buf, 4 * 1024 * 1024);
+    _ = try child.wait();
+    return out_buf.toOwnedSlice();
+}
+
+/// Read a single member's contents from a tarball, into memory. Returns owned.
+fn tarReadMember(allocator: std.mem.Allocator, tar_path: []const u8, member: []const u8) ![]u8 {
+    var child = std.process.Child.init(&.{ "tar", "-xzOf", tar_path, member }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+    var out_buf = std.ArrayList(u8).init(allocator);
+    errdefer out_buf.deinit();
+    var err_buf = std.ArrayList(u8).init(allocator);
+    defer err_buf.deinit();
+    try child.collectOutput(&out_buf, &err_buf, 4 * 1024 * 1024);
+    _ = try child.wait();
+    return out_buf.toOwnedSlice();
+}
+
+test "backup: default excludes identity.key" {
+    try skipIfMissing(&.{ "age-keygen", "sops", "tar" });
+    const a = testing.allocator;
+    const bin = try resolveBin(a);
+    defer a.free(bin);
+
+    const dir = try makeTmpDir(a);
+    defer a.free(dir);
+    defer rmTreeAbs(dir);
+
+    {
+        var out = try runEnvlessOk(a, bin, dir, null, &.{"init"});
+        defer out.deinit(a);
+    }
+    {
+        var out = try runEnvlessOk(a, bin, dir, "sk-test-xyz", &.{ "set", "OPENAI_API_KEY" });
+        defer out.deinit(a);
+    }
+
+    const tar_path = try std.fs.path.join(a, &.{ dir, "out.tar.gz" });
+    defer a.free(tar_path);
+
+    {
+        var out = try runEnvlessOk(a, bin, dir, null, &.{ "backup", "--output", tar_path });
+        defer out.deinit(a);
+    }
+
+    const members = try tarMembers(a, tar_path);
+    defer a.free(members);
+
+    if (std.mem.indexOf(u8, members, ".envless/identity.key") != null) {
+        std.debug.print("default backup MUST NOT contain identity.key, got:\n{s}\n", .{members});
+        return error.TestUnexpectedIdentity;
+    }
+    if (std.mem.indexOf(u8, members, ".envless/recipients") == null) {
+        std.debug.print("expected recipients in members, got:\n{s}\n", .{members});
+        return error.TestMissingRecipients;
+    }
+    if (std.mem.indexOf(u8, members, "secrets/dev.env.enc") == null) {
+        std.debug.print("expected secrets/dev.env.enc, got:\n{s}\n", .{members});
+        return error.TestMissingSecrets;
+    }
+    if (std.mem.indexOf(u8, members, "MANIFEST.json") == null) {
+        std.debug.print("expected MANIFEST.json, got:\n{s}\n", .{members});
+        return error.TestMissingManifest;
+    }
+}
+
+test "backup: --include-identity --yes includes identity.key" {
+    try skipIfMissing(&.{ "age-keygen", "sops", "tar" });
+    const a = testing.allocator;
+    const bin = try resolveBin(a);
+    defer a.free(bin);
+
+    const dir = try makeTmpDir(a);
+    defer a.free(dir);
+    defer rmTreeAbs(dir);
+
+    {
+        var out = try runEnvlessOk(a, bin, dir, null, &.{"init"});
+        defer out.deinit(a);
+    }
+    {
+        var out = try runEnvlessOk(a, bin, dir, "sk-test-xyz", &.{ "set", "OPENAI_API_KEY" });
+        defer out.deinit(a);
+    }
+
+    const tar_path = try std.fs.path.join(a, &.{ dir, "out.tar.gz" });
+    defer a.free(tar_path);
+
+    {
+        var out = try runEnvlessOk(a, bin, dir, null, &.{
+            "backup", "--include-identity", "--yes", "--output", tar_path,
+        });
+        defer out.deinit(a);
+    }
+
+    const members = try tarMembers(a, tar_path);
+    defer a.free(members);
+
+    if (std.mem.indexOf(u8, members, ".envless/identity.key") == null) {
+        std.debug.print("expected identity.key in members, got:\n{s}\n", .{members});
+        return error.TestMissingIdentity;
+    }
+}
+
+test "backup: --include-identity without --yes in non-tty exits 2" {
+    try skipIfMissing(&.{ "age-keygen", "sops" });
+    const a = testing.allocator;
+    const bin = try resolveBin(a);
+    defer a.free(bin);
+
+    const dir = try makeTmpDir(a);
+    defer a.free(dir);
+    defer rmTreeAbs(dir);
+
+    {
+        var out = try runEnvlessOk(a, bin, dir, null, &.{"init"});
+        defer out.deinit(a);
+    }
+
+    const tar_path = try std.fs.path.join(a, &.{ dir, "out.tar.gz" });
+    defer a.free(tar_path);
+
+    // runEnvless wires stdin via .Ignore when stdin_text is null, which the
+    // child sees as a non-TTY descriptor. That matches the script-context
+    // branch in cli/backup.zig (no --yes => exit 2).
+    var out = try runEnvless(a, bin, dir, null, &.{
+        "backup", "--include-identity", "--output", tar_path,
+    });
+    defer out.deinit(a);
+
+    if (out.code != 2) {
+        std.debug.print(
+            "expected exit 2 (usage), got {d}\nstdout={s}\nstderr={s}\n",
+            .{ out.code, out.stdout, out.stderr },
+        );
+        return error.TestUnexpectedExitCode;
+    }
+    if (std.mem.indexOf(u8, out.stderr, "--yes") == null) {
+        std.debug.print("expected stderr to mention --yes:\n{s}\n", .{out.stderr});
+        return error.TestMissingYesMention;
+    }
+}
+
+test "backup: manifest schema_version + pubkey present" {
+    try skipIfMissing(&.{ "age-keygen", "sops", "tar" });
+    const a = testing.allocator;
+    const bin = try resolveBin(a);
+    defer a.free(bin);
+
+    const dir = try makeTmpDir(a);
+    defer a.free(dir);
+    defer rmTreeAbs(dir);
+
+    {
+        var out = try runEnvlessOk(a, bin, dir, null, &.{"init"});
+        defer out.deinit(a);
+    }
+    {
+        var out = try runEnvlessOk(a, bin, dir, "sk-test-xyz", &.{ "set", "OPENAI_API_KEY" });
+        defer out.deinit(a);
+    }
+
+    const tar_path = try std.fs.path.join(a, &.{ dir, "out.tar.gz" });
+    defer a.free(tar_path);
+
+    {
+        var out = try runEnvlessOk(a, bin, dir, null, &.{ "backup", "--output", tar_path });
+        defer out.deinit(a);
+    }
+
+    const manifest = try tarReadMember(a, tar_path, "MANIFEST.json");
+    defer a.free(manifest);
+
+    // Minimal shape assertions — we don't pull in a JSON parser for this; the
+    // manifest is rendered by hand so substring matching is sufficient.
+    inline for ([_][]const u8{
+        "\"schema_version\": 1",
+        "\"envless_version\":",
+        "\"created_at\":",
+        "\"pubkey\": \"age1",
+        "\"includes_identity\": false",
+        "\"envs\": [\"dev\"]",
+        "\"file_count\":",
+    }) |needle| {
+        if (std.mem.indexOf(u8, manifest, needle) == null) {
+            std.debug.print("manifest missing {s}\n--- manifest ---\n{s}\n", .{ needle, manifest });
+            return error.TestManifestShape;
+        }
+    }
+}

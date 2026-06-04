@@ -3,7 +3,7 @@ title: CLI reference
 description: Every subcommand, every flag, every exit code, every file format envless touches, and every environment variable it reads or sets. The single source of truth.
 ---
 
-`envless` has eight subcommands plus a root version flag. The surface
+`envless` has nine subcommands plus a root version flag. The surface
 is deliberately flat — no nested groups, no hidden commands.
 
 ```
@@ -15,6 +15,7 @@ envless get    KEY                        [--env=ENV] --confirm
 envless list                              [--env=ENV]
 envless exec                              [--env=ENV] -- CMD [ARGS...]
 envless migrate FILE                      [--env=ENV] [--keep]
+envless backup                            [--output PATH] [--include-identity] [--yes]
 envless mcp                                                          # JSON-RPC 2.0 stdio MCP server
 envless daemon [install|uninstall|status|stop]                       # optional decrypt-cache daemon
 ```
@@ -165,6 +166,88 @@ MIGRATE  src=.env env=dev keys=3
 REMOVE   .env
 ```
 
+### `envless backup`
+
+Bundles envless state — `.envless/recipients`, every
+`secrets/<env>.env.enc`, and a `MANIFEST.json` — into a single
+`tar.gz`. The age secret key (`.envless/identity.key`) is **excluded
+by default** so the resulting tarball is safe to upload to any
+storage destination.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--output` | (stdout) | Path to write the tarball. `-` or omitted = stream to stdout (composes with `rclone rcat`, `gpg --symmetric`, etc.). |
+| `--include-identity` | `false` | Also include `.envless/identity.key`. Requires interactive confirmation, or `--yes` in non-interactive contexts. |
+| `--yes` | `false` | Bypass the interactive prompt when `--include-identity` is set. Required for scripts and cron. |
+
+Resolution: `envless backup` walks up from the current directory
+looking for `.envless/identity.key` and treats the dir containing it
+as the repo root. So you can run `envless backup` from any
+subdirectory of the project.
+
+Tarball layout:
+
+```
+MANIFEST.json
+.envless/recipients
+.envless/identity.key      # only when --include-identity
+secrets/dev.env.enc
+secrets/prod.env.enc
+…
+```
+
+`MANIFEST.json` schema (version 1):
+
+```json
+{
+  "schema_version": 1,
+  "envless_version": "v0.1.0",
+  "created_at": "2026-06-04T12:34:56Z",
+  "repo_root": "/Users/alice/my-app",
+  "pubkey": "age1...",
+  "includes_identity": false,
+  "envs": ["dev", "prod"],
+  "file_count": 4
+}
+```
+
+Output (file mode):
+
+```
+BACKUP  out=backup.tar.gz identity=excluded
+```
+
+Output (stdout mode): the raw tarball bytes go to stdout, nothing
+else; status messages all go to stderr so the pipe stays clean.
+
+Examples:
+
+```bash
+# Safe default — recipients + encrypted envs + manifest, identity excluded.
+envless backup --output backup-$(date -u +%Y%m%d).tar.gz
+
+# Stream to a cloud sync without a local tempfile.
+envless backup | rclone rcat gdrive:envless-backups/$(date -u +%Y%m%d).tar.gz
+
+# Identity-included backup, GPG-encrypted before any storage.
+envless backup --include-identity --yes --output - \
+  | gpg --symmetric --cipher-algo AES256 \
+        --output backup.tar.gz.gpg
+```
+
+Exit codes specific to `backup`:
+
+- `0` — success.
+- `1` — user cancelled the `--include-identity` prompt.
+- `2` — usage error (e.g. `--include-identity` without `--yes` in a
+  non-TTY context).
+- `64` — configuration error: no `.envless/identity.key` found in
+  the current directory or any parent.
+- `74` — IO error (stage, tar invocation, file copy).
+
+See [Operations → Backup & restore](/envless/operations/#backup--restore)
+for upload-destination guidance and scheduled-backup recipes.
+
 ### `envless mcp`
 
 Run the [Model Context Protocol](https://modelcontextprotocol.io) server
@@ -307,6 +390,11 @@ child's exit code verbatim, and `get`, which fails fast without
 - **`envless migrate`** — `0` on success (and on `--keep`). `1` if
   the source file is missing, unreadable, fails to parse, or the
   encrypt step fails.
+- **`envless backup`** — `0` on success. `1` if the user cancels the
+  `--include-identity` prompt. `2` for usage errors, including
+  `--include-identity` in a non-TTY context without `--yes`. `64` if
+  no `.envless/identity.key` is found by walking up from cwd. `74`
+  for IO failures during staging or tar invocation.
 
 ### Implementation reference
 
@@ -548,6 +636,7 @@ parser deliberately small; richer parsing lands in v0.1.
 | `list` | [`zig/src/cli/list.zig`][gh-list] |
 | `exec` | [`zig/src/cli/exec.zig`][gh-exec] |
 | `migrate` | [`zig/src/cli/migrate.zig`][gh-migrate] |
+| `backup` | [`zig/src/cli/backup.zig`][gh-backup] + [`zig/src/backup.zig`][gh-backup-mod] |
 | `mcp` | [`zig/src/cli/mcp.zig`](https://github.com/biliboss/envless/blob/main/zig/src/cli/mcp.zig), [`zig/src/mcp.zig`](https://github.com/biliboss/envless/blob/main/zig/src/mcp.zig) |
 | `daemon` | [`zig/src/cli/daemon.zig`](https://github.com/biliboss/envless/blob/main/zig/src/cli/daemon.zig), [`zig/src/daemon.zig`](https://github.com/biliboss/envless/blob/main/zig/src/daemon.zig), [`zig/src/ipc.zig`](https://github.com/biliboss/envless/blob/main/zig/src/ipc.zig), [`zig/src/launchd.zig`](https://github.com/biliboss/envless/blob/main/zig/src/launchd.zig), [`zig/src/systemd.zig`](https://github.com/biliboss/envless/blob/main/zig/src/systemd.zig) |
 | root wiring | [`zig/src/cli/root.zig`][gh-root] |
@@ -560,6 +649,8 @@ parser deliberately small; richer parsing lands in v0.1.
 [gh-list]: https://github.com/biliboss/envless/blob/main/zig/src/cli/list.zig
 [gh-exec]: https://github.com/biliboss/envless/blob/main/zig/src/cli/exec.zig
 [gh-migrate]: https://github.com/biliboss/envless/blob/main/zig/src/cli/migrate.zig
+[gh-backup]: https://github.com/biliboss/envless/blob/main/zig/src/cli/backup.zig
+[gh-backup-mod]: https://github.com/biliboss/envless/blob/main/zig/src/backup.zig
 [gh-root]: https://github.com/biliboss/envless/blob/main/zig/src/cli/root.zig
 [gh-execenv]: https://github.com/biliboss/envless/blob/main/zig/src/execenv.zig
 [gh-sopswrap]: https://github.com/biliboss/envless/blob/main/zig/src/sops.zig
