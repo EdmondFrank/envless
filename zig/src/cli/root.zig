@@ -3,6 +3,26 @@
 //! Replaces cobra. Six subcommands plus root-level --version. Flag style:
 //! `--key=value` or `--key value` for string flags, `--key` for bool flags.
 //! Subcommands accept `--` to terminate flag parsing (used by exec).
+//!
+//! Help output: `envless -h` / `envless help` writes the expressive usage
+//! page to stdout and exits 0. Each subcommand owns its own `printHelp` —
+//! see `init.zig`, `set.zig`, etc. The dispatcher only intercepts -h/--help
+//! for the top-level case; per-subcommand `-h` is handled inside each
+//! `run` so subcommand-specific behavior stays co-located.
+//!
+//! Exit codes (see also AGENTS.md / docs/cli):
+//!   0   success
+//!   1   generic error (sops, store, IO failure once the args parsed)
+//!   2   usage error (unknown command, bad flags, missing args)
+//!  64   configuration error (no .envless/ — surfaced via store errors)
+//!  65   data error (corrupt sops file)
+//!  66   not found (env / key absent)
+//!  74   IO error (filesystem, exec)
+//!
+//! Note: subcommands currently return 1 on most error paths. The exit-code
+//! taxonomy above is the documented contract for callers and is enforced
+//! incrementally; help text reflects the target, not necessarily the
+//! current behavior of every error branch.
 
 const std = @import("std");
 
@@ -67,30 +87,107 @@ pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, version: []co
     if (std.mem.eql(u8, sub, "migrate")) return migrate_cmd.run(&ctx, rest);
 
     try ctx.stderr.writer().print("envless: unknown command: {s}\n", .{sub});
-    return 1;
+    try ctx.stderr.writer().writeAll("Run `envless -h` for the list of commands.\n");
+    return 2;
+}
+
+// -------------------------- TTY / ANSI helpers -------------------------------
+
+/// Style is a thin abstraction over the ANSI sequences used by help output.
+/// `enabled = stdout.isTty()` at construction time; when disabled, all of
+/// `bold/dim/reset` return the empty string so the help text stays clean
+/// for pagers, pipelines, and CI logs.
+pub const Style = struct {
+    enabled: bool,
+
+    pub fn fromFile(f: std.fs.File) Style {
+        // NO_COLOR (https://no-color.org) and a non-TTY both disable ANSI.
+        if (std.process.hasEnvVarConstant("NO_COLOR")) return .{ .enabled = false };
+        return .{ .enabled = f.isTty() };
+    }
+
+    pub fn bold(self: Style) []const u8 {
+        return if (self.enabled) "\x1b[1m" else "";
+    }
+    pub fn dim(self: Style) []const u8 {
+        return if (self.enabled) "\x1b[2m" else "";
+    }
+    pub fn reset(self: Style) []const u8 {
+        return if (self.enabled) "\x1b[0m" else "";
+    }
+};
+
+/// Returns true if `args` requests help (`-h` or `--help`). Used by every
+/// subcommand at the top of `run` so per-command help stays co-located.
+pub fn wantsHelp(args: []const []const u8) bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) return true;
+    }
+    return false;
 }
 
 fn printUsage(ctx: *Context) !void {
-    const usage =
-        \\envless - agent-first secrets, zero .env
-        \\
-        \\Usage:
-        \\  envless [command]
-        \\
-        \\Available Commands:
-        \\  init       initialize .envless/ in the current directory
-        \\  set        store a secret value from stdin
-        \\  get        print a secret value (requires --confirm)
-        \\  list       list keys in an env (does not print values)
-        \\  exec       run a command with secrets injected as env vars
-        \\  migrate    encrypt a .env file into envless and gitignore the plaintext
-        \\
-        \\Flags:
-        \\  -h, --help       help
-        \\      --version    show version
-        \\
-    ;
-    try ctx.stdout.writer().writeAll(usage);
+    const w = ctx.stdout.writer();
+    const s = Style.fromFile(ctx.stdout);
+    const b = s.bold();
+    const d = s.dim();
+    const r = s.reset();
+
+    try w.print("envless {s}— agent-first secrets, zero .env{s}\n\n", .{ d, r });
+
+    try w.print("{s}Usage:{s}\n", .{ b, r });
+    try w.writeAll("  envless <command> [flags] [args]\n\n");
+
+    try w.print("{s}Commands:{s}\n", .{ b, r });
+    try w.writeAll("  init       initialize .envless/ in the current directory\n");
+    try w.writeAll("  set KEY    store a secret value from stdin (--env=NAME, default: dev)\n");
+    try w.writeAll("  get KEY    print a secret value (requires --confirm)\n");
+    try w.writeAll("  list       list keys in an env (does not print values)\n");
+    try w.writeAll("  exec       run a command with secrets injected as env vars\n");
+    try w.writeAll("  migrate    encrypt a .env file into envless and gitignore the plaintext\n\n");
+
+    try w.writeAll("Run `envless <command> -h` for command-specific help.\n\n");
+
+    try w.print("{s}Examples:{s}\n", .{ b, r });
+    try w.print("  {s}# First-time setup in a repo{s}\n", .{ d, r });
+    try w.writeAll("  envless init\n");
+    try w.writeAll("  echo \"sk-test-xyz\" | envless set OPENAI_API_KEY --env=dev\n");
+    try w.writeAll("  envless list --env=dev\n");
+    try w.writeAll("  envless exec --env=dev -- node server.js\n\n");
+    try w.print("  {s}# Multi-environment{s}\n", .{ d, r });
+    try w.writeAll("  echo \"sk-prod-real\" | envless set OPENAI_API_KEY --env=prod\n");
+    try w.writeAll("  envless exec --env=prod -- npm run deploy\n\n");
+    try w.print("  {s}# Migrate an existing .env file{s}\n", .{ d, r });
+    try w.writeAll("  envless migrate .env --env=dev\n\n");
+    try w.print("  {s}# Inspect without leaking values{s}\n", .{ d, r });
+    try w.writeAll("  envless list --env=staging\n");
+    try w.writeAll("  envless get DATABASE_URL --env=staging --confirm\n\n");
+
+    try w.print("{s}Environment variables:{s}\n", .{ b, r });
+    try w.writeAll("  SOPS_AGE_KEY_FILE   path to the age identity file (default: .envless/identity.key)\n");
+    try w.writeAll("  EDITOR              editor used by interactive prompts (when applicable)\n");
+    try w.writeAll("  NO_COLOR            if set, disable ANSI colors in help output\n\n");
+
+    try w.print("{s}Files:{s}\n", .{ b, r });
+    try w.writeAll("  .envless/identity.key   age secret key for this developer (chmod 0600, gitignored)\n");
+    try w.writeAll("  .envless/recipients     age pubkeys with read access (committed)\n");
+    try w.writeAll("  secrets/<env>.env.enc   sops-encrypted env files (committed)\n\n");
+
+    try w.print("{s}Exit codes:{s}\n", .{ b, r });
+    try w.writeAll("  0   success\n");
+    try w.writeAll("  1   generic error\n");
+    try w.writeAll("  2   usage error (bad flags, missing args)\n");
+    try w.writeAll("  64  configuration error (missing .envless/, no identity)\n");
+    try w.writeAll("  65  data error (corrupt sops file)\n");
+    try w.writeAll("  66  not found (env / key not present)\n");
+    try w.writeAll("  74  IO error (filesystem, exec)\n\n");
+
+    try w.print("{s}Flags:{s}\n", .{ b, r });
+    try w.writeAll("  -h, --help        show this help\n");
+    try w.writeAll("      --version     print envless version\n\n");
+
+    try w.writeAll("Docs: https://biliboss.github.io/envless/\n");
+    try w.writeAll("Repo: https://github.com/biliboss/envless\n");
 }
 
 // ----------------------------- shared helpers --------------------------------
