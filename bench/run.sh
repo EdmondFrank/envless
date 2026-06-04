@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# bench/run.sh — DevOps metric driver for envless.
+# bench/run.sh — DevOps metric driver for envless (Zig-only).
 #
-# Builds the Go binary (and, if zig/build.zig exists, the Zig binary), then
+# Builds the Zig binary at zig/zig-out/bin/envless (ReleaseSmall) and
 # measures: build time, binary size, cold start, `envless list` latency,
-# `envless exec` latency, peak RSS, and e2e wall-clock. All metrics for all
-# binaries in the run are emitted to a single JSON file under bench/results/
-# keyed by the current git SHA.
+# `envless exec` latency, peak RSS, and e2e wall-clock. Emits one
+# verbose JSON file under bench/results/<sha>.json plus one summary line
+# appended to bench/history.jsonl.
 #
 # Exits non-zero on any benchmark failure so CI fails loudly.
 #
-# Prereqs: hyperfine, sops, age, go (optional zig, jq).
+# This is the ONE intentional bash file remaining in the repo — hyperfine
+# orchestration is bash-native by tradition and porting it to Zig is
+# 500+ LOC of zero-value infrastructure code. See AGENTS.md.
+#
+# Prereqs: hyperfine, jq, zig, sops, age.
 
 set -euo pipefail
 
@@ -26,7 +30,8 @@ need() {
   command -v "$1" >/dev/null 2>&1 || { echo "bench: missing required tool: $1" >&2; exit 1; }
 }
 need hyperfine
-need go
+need jq
+need zig
 need sops
 need age
 
@@ -35,15 +40,8 @@ GIT_SHORT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 OS_NAME="$(uname -s)"
 ARCH_NAME="$(uname -m)"
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-GO_VERSION="$(go version | awk '{print $3}')"
+ZIG_VERSION="$(zig version)"
 HYPERFINE_VERSION="$(hyperfine --version | awk '{print $2}')"
-
-ZIG_VERSION="null"
-HAS_ZIG=0
-if [[ -f "$REPO_ROOT/zig/build.zig" ]] && command -v zig >/dev/null 2>&1; then
-  HAS_ZIG=1
-  ZIG_VERSION="\"$(zig version)\""
-fi
 
 # --- per-toolchain bench runner ---------------------------------------------------
 TMP="$(mktemp -d -t envless-bench-XXXXXX)"
@@ -83,36 +81,27 @@ peak_rss_bytes() {
   fi
 }
 
-# Read mean+stddev from a hyperfine JSON export.
-hf_mean() { jq -r '.results[0].mean' "$1"; }
-hf_stddev() { jq -r '.results[0].stddev' "$1"; }
-hf_min() { jq -r '.results[0].min' "$1"; }
-hf_max() { jq -r '.results[0].max' "$1"; }
-
-need jq
-
-# Runs every metric for one toolchain. Echoes a JSON object on stdout.
-bench_toolchain() {
-  local label="$1"        # "go" | "zig"
-  local bin_path="$2"     # absolute path to a built envless binary
-  local build_cmd="$3"    # full shell command that produces bin_path
+# Runs every metric for the Zig toolchain. Echoes a JSON object on stdout.
+bench_zig() {
+  local label="zig"
+  local bin_path="$REPO_ROOT/zig/zig-out/bin/envless"
+  local build_cmd="cd zig && zig build -Doptimize=ReleaseSmall"
 
   echo "==> [$label] bench start (bin=$bin_path)" >&2
 
   # 1. Build time.
   # NOTE: hyperfine and the fallback rebuild are both wrapped in `bash -c`
   # subshells so a `cd zig && …` style build_cmd cannot leak its cwd into
-  # the rest of the bench (which would break e2e step that expects
+  # the rest of the bench (which would break the e2e step that expects
   # repo-root cwd).
   local build_json="$TMP/${label}-build.json"
   echo "    [$label] build time" >&2
   if ! hyperfine --warmup 3 --runs 10 \
     --export-json "$build_json" \
-    --prepare "rm -f '$bin_path'" \
+    --prepare "rm -rf '$REPO_ROOT/zig/zig-out' '$REPO_ROOT/zig/.zig-cache'" \
     "bash -c \"$build_cmd\"" >&2; then
-    echo "    [$label] build FAILED — skipping remaining metrics for $label" >&2
-    echo "null"
-    return 0
+    echo "    [$label] build FAILED" >&2
+    return 1
   fi
 
   # Verify the artifact exists for the rest of the metrics.
@@ -121,9 +110,8 @@ bench_toolchain() {
     ( eval "$build_cmd" ) >&2 || true
   fi
   if [[ ! -x "$bin_path" ]]; then
-    echo "    [$label] artifact missing after build — skipping" >&2
-    echo "null"
-    return 0
+    echo "    [$label] artifact missing after build" >&2
+    return 1
   fi
 
   # 2. Binary size.
@@ -164,15 +152,15 @@ bench_toolchain() {
   echo "    [$label] peak RSS" >&2
   rss="$(cd "$seed_dir" && peak_rss_bytes "$bin_path" list --env=dev)"
 
-  # 8. E2E wall-clock.
+  # 8. E2E wall-clock — `zig build e2e` against the just-built binary.
   echo "    [$label] e2e wall-clock" >&2
   local e2e_start e2e_end e2e_dur e2e_exit=0
   e2e_start=$(date +%s.%N 2>/dev/null || date +%s)
-  if ! BIN="$bin_path" go test -count=1 ./e2e/... >"$TMP/${label}-e2e.log" 2>&1; then
+  if ! ( cd "$REPO_ROOT/zig" && zig build e2e ) >"$TMP/${label}-e2e.log" 2>&1; then
     e2e_exit=$?
     echo "    [$label] e2e FAILED (exit=$e2e_exit) — see $TMP/${label}-e2e.log" >&2
     tail -40 "$TMP/${label}-e2e.log" >&2 || true
-    exit 1
+    return 1
   fi
   e2e_end=$(date +%s.%N 2>/dev/null || date +%s)
   e2e_dur=$(awk -v a="$e2e_start" -v b="$e2e_end" 'BEGIN{printf "%.3f", b - a}')
@@ -201,33 +189,10 @@ bench_toolchain() {
      }'
 }
 
-# --- run benchmarks per toolchain --------------------------------------------------
+# --- run benchmarks ---------------------------------------------------------------
 TOOLCHAINS_JSON="$TMP/toolchains.json"
-echo "[]" > "$TOOLCHAINS_JSON"
-
-run_one() {
-  local label="$1" bin="$2" build_cmd="$3"
-  local out
-  out="$(bench_toolchain "$label" "$bin" "$build_cmd")"
-  # Skip if the toolchain build failed (bench_toolchain emitted "null").
-  if [[ "$out" == "null" ]]; then
-    echo "==> [$label] omitted from results" >&2
-    return 0
-  fi
-  jq --argjson new "$out" '. + [$new]' "$TOOLCHAINS_JSON" > "$TOOLCHAINS_JSON.tmp"
-  mv "$TOOLCHAINS_JSON.tmp" "$TOOLCHAINS_JSON"
-}
-
-# Go binary.
-GO_BIN="$REPO_ROOT/bin/envless"
-run_one "go" "$GO_BIN" "make build"
-
-# Zig binary, if present.
-if [[ "$HAS_ZIG" -eq 1 ]]; then
-  # Zig's build root is the zig/ subdir, so the install prefix is zig/zig-out.
-  ZIG_BIN="$REPO_ROOT/zig/zig-out/bin/envless"
-  run_one "zig" "$ZIG_BIN" "cd zig && zig build -Doptimize=ReleaseSmall"
-fi
+bench_zig > "$TMP/zig.json"
+jq -n --slurpfile z "$TMP/zig.json" '[$z[0]]' > "$TOOLCHAINS_JSON"
 
 # --- assemble final result file ---------------------------------------------------
 OUT_FILE="$RESULTS_DIR/${GIT_SHA}.json"
@@ -237,8 +202,7 @@ jq -n \
   --arg ts "$TIMESTAMP" \
   --arg os "$OS_NAME" \
   --arg arch "$ARCH_NAME" \
-  --arg go_v "$GO_VERSION" \
-  --argjson zig_v "$ZIG_VERSION" \
+  --arg zig_v "$ZIG_VERSION" \
   --arg hf_v "$HYPERFINE_VERSION" \
   --slurpfile toolchains "$TOOLCHAINS_JSON" \
   '{
@@ -247,7 +211,7 @@ jq -n \
      git_short: $short,
      timestamp: $ts,
      platform: { os: $os, arch: $arch },
-     toolchain_versions: { go: $go_v, zig: $zig_v, hyperfine: $hf_v },
+     toolchain_versions: { zig: $zig_v, hyperfine: $hf_v },
      toolchains: $toolchains[0]
    }' > "$OUT_FILE"
 
