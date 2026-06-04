@@ -4,10 +4,22 @@ Agent-first secrets. Zero `.env`. Zero servers. `process.env` kept.
 
 > **Status:** v0.0.1 — single-user core works. Teams + plugins + skill in v0.1.
 
+## Install
+
+```bash
+# Homebrew (macOS + Linux). Pulls age + sops as deps.
+brew tap biliboss/envless https://github.com/biliboss/envless
+brew install biliboss/envless/envless
+```
+
+Or download a pre-built tarball from
+[Releases](https://github.com/biliboss/envless/releases), or build
+from source (see below).
+
 ## Quickstart
 
 ```bash
-# build
+# build from source (needs Zig 0.13.0)
 cd zig && zig build -Doptimize=ReleaseSmall
 
 # in any project

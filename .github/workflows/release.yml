@@ -50,3 +50,73 @@ jobs:
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: bump Homebrew formula
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Strip leading "v" so the formula's `version` field is bare semver
+          # (Homebrew convention). URLs reconstruct the "v" via "v#{version}".
+          VER="${TAG#v}"
+
+          # Extract sha256 per target from dist/checksums.txt. Format per line:
+          #   <sha256>  envless_<TAG>_<triple>.tar.gz
+          sha_for() {
+            awk -v f="envless_${TAG}_$1.tar.gz" '$2 == f {print $1; exit}' dist/checksums.txt
+          }
+          SHA_ARM_MAC=$(sha_for aarch64-macos)
+          SHA_X86_MAC=$(sha_for x86_64-macos)
+          SHA_ARM_LIN=$(sha_for aarch64-linux-gnu)
+          SHA_X86_LIN=$(sha_for x86_64-linux-gnu)
+
+          for s in "$SHA_ARM_MAC" "$SHA_X86_MAC" "$SHA_ARM_LIN" "$SHA_X86_LIN"; do
+            [[ -n "$s" ]] || { echo "bump: missing sha256 in checksums.txt" >&2; exit 1; }
+          done
+
+          export VER SHA_ARM_MAC SHA_X86_MAC SHA_ARM_LIN SHA_X86_LIN
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+
+          p = Path("Formula/envless.rb")
+          t = p.read_text()
+
+          t, n = re.subn(r'version "[^"]+"', f'version "{os.environ["VER"]}"', t, count=1)
+          if n != 1:
+              raise SystemExit("bump: expected 1 version line")
+
+          shas = [
+              os.environ["SHA_ARM_MAC"],
+              os.environ["SHA_X86_MAC"],
+              os.environ["SHA_ARM_LIN"],
+              os.environ["SHA_X86_LIN"],
+          ]
+          idx = 0
+          def sub(_):
+              global idx
+              s = shas[idx]
+              idx += 1
+              return f'sha256 "{s}"'
+          t = re.sub(r'sha256 "[0-9a-f]{64}"', sub, t)
+          if idx != 4:
+              raise SystemExit(f"bump: expected 4 sha256 fields, replaced {idx}")
+
+          p.write_text(t)
+          PY
+
+      - name: commit formula bump
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet Formula/envless.rb; then
+            echo "Formula/envless.rb already up to date"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/envless.rb
+          git commit -m "chore(brew): bump formula to ${TAG}"
+          # Push to main. Fast-forward only so a concurrent push wins safely.
+          git push origin HEAD:main

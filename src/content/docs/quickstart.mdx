@@ -35,9 +35,28 @@ sudo pacman -S age sops
 
 ### `envless` itself
 
-Download a pre-built binary from
-[GitHub Releases](https://github.com/biliboss/envless/releases), or
-clone + build from source:
+**Homebrew (macOS + Linux):**
+
+```bash
+brew tap biliboss/envless https://github.com/biliboss/envless
+brew install biliboss/envless/envless
+```
+
+The tap lives in the main repo (no separate `homebrew-envless` repo)
+— the URL after `brew tap` is what tells brew where to look. `age`
+and `sops` are formula dependencies so the line above installs the
+full toolchain.
+
+**Pre-built tarball:**
+
+Download from
+[GitHub Releases](https://github.com/biliboss/envless/releases). The
+tarballs are named `envless_v<version>_<triple>.tar.gz` for each of
+`aarch64-macos`, `x86_64-macos`, `aarch64-linux-gnu`,
+`x86_64-linux-gnu`. Extract and put the `envless` binary on `PATH`.
+`dist/checksums.txt` accompanies each release.
+
+**From source:**
 
 ```bash
 git clone https://github.com/biliboss/envless.git
