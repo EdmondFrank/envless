@@ -1,0 +1,255 @@
+---
+title: Architecture
+description: Why .env breaks once agents and teams arrive, how envless replaces it, and what happens at every stage of a secret's life — from `init` to `exec`.
+---
+
+`envless` is a thin orchestrator over two external binaries
+(`age-keygen` and `sops`) and the filesystem. There is no daemon, no
+cache, no in-memory state across invocations. Every command reads from
+disk, shells out, and exits.
+
+The whole point is to replace `.env` with something that survives
+multiple agents, multiple teammates, and shared logs — without growing
+into a SaaS. This page narrates that design, then walks the lifecycle
+of a single secret from `init` to `exec`.
+
+## The .env problem
+
+`.env` files were designed for one human, one machine, one trust
+boundary. AI agents shatter all three.
+
+### What `.env` assumes
+
+1. **One person uses the secrets.** No granular access control.
+   Whoever has the file has everything.
+2. **The machine is trusted.** Plaintext on disk is fine because only
+   you read it.
+3. **You distribute out-of-band.** Slack DMs, password managers,
+   "ping me when you onboard."
+
+Those assumptions held when codebases had three developers and zero
+autonomous processes touching the file. They no longer hold.
+
+### What changed
+
+- **Multiple agents per developer.** Background sessions, scheduled
+  jobs, delegated panes. Each may need different scopes.
+- **Logs in shared contexts.** Agent transcripts, asciinemas,
+  screen-shares. A single `cat .env` becomes a public broadcast.
+- **CI/CD shares the same file.** GitHub Actions secrets diverge from
+  local `.env`, drift accumulates, prod breaks.
+- **Rotation is impossible at scale.** Rotating one API key means
+  updating N humans, M agents, K CI environments. Most teams skip.
+
+### What envless does differently
+
+```
+.env (plaintext, gitignored)        →  secrets/*.env.enc (encrypted, committed)
+shared password / file              →  per-identity age keypairs
+out-of-band onboarding              →  PR adds pubkey to recipients
+"hope it doesn't leak"              →  recipient list is the access-control plane
+rotation requires N updates         →  rotation re-encrypts to current recipients
+```
+
+The substrate is two well-audited primitives —
+[age](https://age-encryption.org/v1) (file encryption) and
+[sops](https://getsops.io/docs/) (per-value encryption with recipient
+lists). `envless` is the agent-facing ergonomics layer on top.
+
+### Why not just use sops directly?
+
+You can. We did for a while. Three issues kept biting:
+
+1. **No `process.env` bridge.** `sops exec-env` exists but only handles
+   dotenv format awkwardly. `envless exec` is the same idea, polished.
+2. **No identity bootstrap.** sops assumes you already have an age
+   key. Most devs do not. `envless init` solves it in one command.
+3. **No migration story.** Going from `.env` to `secrets/dev.env.enc`
+   is a half-dozen manual steps. `envless migrate .env` does it
+   idempotently.
+
+`envless` is sops with the rough edges removed and an opinion about
+how agents fit in.
+
+## Data flow
+
+```mermaid
+flowchart LR
+  user[User / Agent]
+  cli[envless CLI]
+  ident[".envless/identity.key<br/>(age secret key)"]
+  recip[".envless/recipients<br/>(age public keys)"]
+  enc["secrets/&lt;env&gt;.env.enc<br/>(sops-encrypted dotenv)"]
+  sops[sops binary]
+  age[age-keygen binary]
+  child[Child process<br/>process.env populated]
+
+  user -->|exec / set / get| cli
+  cli -->|init| age
+  age --> ident
+  cli -->|read recipients| recip
+  cli -->|encrypt KV| sops
+  sops --> enc
+  cli -->|decrypt| sops
+  sops --> cli
+  cli -->|fork + execve| child
+  ident -. SOPS_AGE_KEY_FILE .-> sops
+```
+
+## Components
+
+| Component | Role | Code |
+|---|---|---|
+| `cmd/envless` | argv entry, version flag | 20 LOC |
+| `internal/ecmd` | cobra subcommand wiring | ~150 LOC |
+| `internal/store` | filesystem layout, KV operations | 159 LOC |
+| `internal/sopswrap` | shells out to `sops`, dotenv roundtrip | 102 LOC |
+| `internal/execenv` | builds env array, spawns child | 64 LOC |
+| `pkg/envparse` | parses `.env` (quotes + comments) | 51 LOC |
+
+(The Zig port at `zig/src/` mirrors the same modules with the same
+contracts — see the [roadmap](/envless/why/#roadmap).)
+
+## On-disk layout
+
+```
+your-repo/
+├── .envless/
+│   ├── identity.key       # age secret key — gitignored
+│   └── recipients         # age public keys — committed
+├── secrets/
+│   ├── dev.env.enc        # sops-encrypted, committed
+│   └── prod.env.enc
+└── .gitignore             # auto-appended on migrate
+```
+
+`.envless/identity.key` is never written into a commit. `envless init`
+permissions it `0600` and the repo `.gitignore` ships with the path
+already excluded. See [CLI reference → File formats](/envless/cli/#file-formats)
+for the byte-level format of each file.
+
+## Why two binaries (age + sops)?
+
+`age` provides the cryptographic primitive: file-level encryption
+against a list of recipients. `sops` adds per-key encryption with
+metadata (data keys, MACs, recipient lists) and a clean roundtrip for
+dotenv format. `envless` does not re-implement either. The trust
+surface is whatever trust you already place in `age` and `sops` — both
+well-audited and narrowly scoped. See
+[Security → Cryptography](/envless/security/#cryptography-age--sops)
+for the formal primitives.
+
+## Lifecycle of a secret
+
+The `e2e/e2e_test.go` file is the executable specification for what
+`envless` does. The stages below narrate that spec.
+
+### Stage 1 — `envless init`
+
+```bash
+envless init
+# → INIT  identity=.envless/identity.key pubkey=age1...
+```
+
+1. Creates `.envless/` with mode `0700`.
+2. Shells out to `age-keygen -o .envless/identity.key`.
+3. Chmods the identity to `0600`.
+4. Scans the key file for the `# public key: ` marker.
+5. Writes `.envless/recipients` containing that one pubkey.
+
+Idempotent. Re-running `init` with an existing identity is a no-op.
+
+### Stage 2 — `envless set KEY` (stdin → encrypted file)
+
+```bash
+echo "sk-test-xyz" | envless set OPENAI_API_KEY
+# → SET   env=dev key=OPENAI_API_KEY
+```
+
+1. Reads value from stdin. Trailing `\n` is stripped.
+2. Calls `store.Read("dev")` — decrypts the existing
+   `secrets/dev.env.enc` if present, else returns an empty map.
+3. Merges the new KV into the map.
+4. Calls `store.Write("dev", merged)`:
+   - Renders dotenv format (sorted keys, `KEY=VALUE\n`, no quoting).
+   - Writes to a temp file in `secrets/`.
+   - Shells out to `sops encrypt --input-type dotenv --output-type
+     dotenv --age <recipients> <tmpfile>`.
+   - Writes sops stdout to `secrets/dev.env.enc`.
+   - Removes the tempfile.
+
+### Stage 3 — `envless list` (keys only)
+
+```bash
+envless list
+# → OPENAI_API_KEY
+```
+
+Decrypts, sorts keys, prints to stdout. Values never touch stdout.
+Same code path as `get`, with the value column stripped.
+
+### Stage 4 — `envless exec -- CMD`
+
+```bash
+envless exec -- node server.js
+```
+
+What happens (per [`internal/execenv`][gh-execenv]):
+
+1. Decrypts the env file via `store.Read(env)`.
+2. Merges the secrets map into the current `os.Environ()`. Secrets
+   override matching parent vars.
+3. Sorts the merged `KEY=VALUE` list for determinism.
+4. Spawns the child with `os/exec.Cmd.Env = merged`.
+5. Stdin/stdout/stderr are passed through.
+6. On non-zero exit, returns an `*execenv.ExitError{Code}` which the
+   CLI propagates via `os.Exit(code)`. See
+   [Exit codes](/envless/cli/#exit-codes).
+
+The child process is unaware that the credentials were ever encrypted.
+It just reads `process.env.OPENAI_API_KEY` like any other variable.
+
+### Stage 5 — `envless migrate FILE`
+
+```bash
+envless migrate .env
+# → MIGRATE  src=.env env=dev keys=3
+# → REMOVE   .env
+```
+
+1. Reads `.env` and runs [`pkg/envparse`][gh-envparse] over it
+   (handles quoted values and trailing `# comments`).
+2. Merges parsed entries into the env (last-write-wins on the env key).
+3. Writes the encrypted file via the same path as `set`.
+4. Appends the source filename to `.gitignore` if not already present.
+5. Removes the plaintext source unless `--keep` is set.
+
+## End to end
+
+These stages are exactly what `TestE2E_InitSetExecRoundtrip` verifies
+on every CI run: init → set → exec → child sees the secret in
+`process.env`. If anything in this lifecycle drifts, that test goes
+red. The test [lives in the repo][gh-e2e] and is treated as the oracle
+for behavior.
+
+## What envless does not try to do
+
+- Replace a real KMS for cloud-native deploys. If you have AWS KMS,
+  use it.
+- Be a password manager. 1Password, Bitwarden, etc. own that surface.
+- Run a server. There is no server. There will never be a server.
+- Have a free tier and a paid tier. There is no tier. It's a binary.
+
+See [Why envless → When NOT to use](/envless/why/#when-not-to-use)
+for the explicit non-goals.
+
+## Further reading
+
+- [age — file encryption format](https://age-encryption.org/v1)
+- [sops — secrets operations](https://getsops.io/docs/)
+- [direnv — shell hook patterns](https://direnv.net/)
+- [teller — provider-fetch alternative](https://github.com/tellerops/teller)
+
+[gh-execenv]: https://github.com/biliboss/envless/blob/main/internal/execenv/execenv.go
+[gh-envparse]: https://github.com/biliboss/envless/blob/main/pkg/envparse/envparse.go
+[gh-e2e]: https://github.com/biliboss/envless/blob/main/e2e/e2e_test.go

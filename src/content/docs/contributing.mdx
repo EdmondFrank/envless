@@ -1,0 +1,383 @@
+---
+title: Contributing
+description: Clone, build, test, release. The development setup, the testing conventions, and how an envless release is cut today.
+---
+
+`envless` is a Go module today, with a Zig port in progress (see the
+[roadmap](/envless/why/#roadmap)). This page covers the full
+contributor surface: getting set up, writing tests that fit, and
+cutting a release.
+
+## Development setup
+
+### Prerequisites
+
+- **Go 1.26+**
+- **age** ≥ 1.2 — `brew install age` / `apt install age`
+- **sops** ≥ 3.9 — install from
+  [getsops/sops releases][sops-releases]
+- A POSIX shell. Tests assume `/bin/sh` is available.
+
+### Clone and build
+
+```bash
+git clone https://github.com/biliboss/envless.git
+cd envless
+
+make build
+# → bin/envless
+
+./bin/envless --version
+```
+
+`make build` (see [`Makefile`][gh-makefile]) runs:
+
+```bash
+go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o bin/envless ./cmd/envless
+```
+
+`VERSION` defaults to `git describe --tags --always --dirty`,
+falling back to `dev`.
+
+### Project layout
+
+```
+.
+├── cmd/envless/main.go              # entrypoint (20 LOC)
+├── internal/
+│   ├── ecmd/                        # cobra subcommands
+│   ├── execenv/                     # env merge + child spawn
+│   ├── sopswrap/                    # sops binary wrapper
+│   └── store/                       # filesystem layout, KV
+├── pkg/envparse/                    # .env parser
+├── e2e/                             # all-Go e2e tests
+├── zig/                             # Zig port (Workstream A)
+├── bench/                           # benchmark harness + results
+├── src/                             # docs site (Astro + Starlight)
+├── public/                          # docs assets
+├── spec/                            # release acceptance specs
+└── .github/workflows/               # ci, release, docs
+```
+
+The `internal/` vs. `pkg/` split mirrors `cli/cli` (the GitHub CLI):
+`internal/` is closed-domain and stateful; `pkg/` is reusable
+utilities (`envparse` could be imported by an external Go project;
+the rest should not).
+
+### Coding style
+
+- Standard Go style: `gofmt`, `go vet`, no extra lint config (yet).
+- `make lint` runs both:
+  ```bash
+  go vet ./...
+  test -z "$(gofmt -l .)"
+  ```
+- Caveman output convention: one line per action, all caps verb,
+  `key=value` fields. Examples from the codebase:
+  ```
+  INIT  identity=.envless/identity.key pubkey=age1...
+  SET   env=dev key=OPENAI_API_KEY
+  MIGRATE  src=.env env=dev keys=3
+  ```
+  No spinners, no banners, no emojis.
+
+### Adding a subcommand
+
+The pattern is one file per subcommand under `internal/ecmd/`,
+following the existing examples:
+
+```go
+// internal/ecmd/foo.go
+func newFooCmd() *cobra.Command {
+    var envName string
+    cmd := &cobra.Command{
+        Use:   "foo [args...]",
+        Short: "one-line description",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            // ...
+            fmt.Fprintf(cmd.OutOrStdout(), "FOO  env=%s\n", envName)
+            return nil
+        },
+    }
+    cmd.Flags().StringVar(&envName, "env", "dev", "environment name")
+    return cmd
+}
+```
+
+Wire it in `internal/ecmd/root.go`'s `root.AddCommand(...)`. Add unit
+tests next to it (`foo_test.go`) and add an `e2e/` scenario.
+
+### Running locally
+
+```bash
+go run ./cmd/envless --version
+go run ./cmd/envless init
+echo "v" | go run ./cmd/envless set TEST
+```
+
+For repeated dev cycles, `make build` plus `./bin/envless` is faster
+because there's no compile-per-invocation.
+
+### Docs site
+
+The docs site (this site) lives at the repo root and is an Astro 5 +
+Starlight 0.30 project. To work on it:
+
+```bash
+pnpm install
+pnpm dev          # live reload on http://localhost:4321
+pnpm build        # production build → dist/
+```
+
+GH Pages deploys are handled by [`.github/workflows/docs.yml`][gh-docs-yml].
+
+### Once Zig lands
+
+The Zig port (Workstream A) lives in `zig/` with its own `build.zig`.
+Until cutover, both binaries are exercised by the same `e2e/` test
+suite. See the [roadmap](/envless/why/#roadmap) for status.
+
+## Testing
+
+`envless` keeps a small, fast test surface. The whole suite runs in
+under three seconds on a laptop. The pattern: colocated unit tests,
+plus a top-level `e2e/` package that builds the real binary and
+shells out.
+
+### Running the suite
+
+```bash
+make test
+# or
+go test -count=1 ./...
+```
+
+CI runs `go test -race -count=1 ./...` (see
+[`.github/workflows/ci.yml`][gh-ci]). `-race` adds the data-race
+detector; we want it green on every PR.
+
+### Layout
+
+| Path | Style | Purpose |
+|---|---|---|
+| `pkg/envparse/envparse_test.go` | Table-driven | Pure-logic parser tests. No I/O. |
+| `internal/execenv/execenv_test.go` | Table-driven | Env merge logic + `Run` against `/bin/sh`. |
+| `internal/sopswrap/sopswrap_test.go` | Skip-if-missing | Roundtrip through real `sops` + `age`. |
+| `internal/store/store_test.go` | Skip-if-missing | Full filesystem behaviour. |
+| `e2e/e2e_test.go` | Subprocess | Builds the binary in `TestMain` and runs it as a black box. |
+
+The e2e suite is the executable spec — when a behaviour changes, the
+e2e test changes too. See [Architecture → Lifecycle of a
+secret](/envless/architecture/#lifecycle-of-a-secret) for what each
+e2e case covers.
+
+### The "skip if missing" pattern
+
+Tests that require `age-keygen` or `sops` use this helper from
+[`e2e/e2e_test.go`][gh-e2e]:
+
+```go
+func skipIfMissing(t *testing.T, bins ...string) {
+    t.Helper()
+    for _, b := range bins {
+        if _, err := exec.LookPath(b); err != nil {
+            t.Skipf("%s not installed", b)
+        }
+    }
+}
+```
+
+Use it at the top of any test that shells out. CI installs both
+binaries, so the skip only happens locally for contributors without
+them.
+
+### Writing a new test
+
+For a new subcommand, add two:
+
+1. **Unit test** next to the implementation. Keep it pure-logic
+   wherever possible — use `cobra.Command.SetIn/SetOut/SetErr` to
+   inject buffers.
+2. **E2E case** in `e2e/e2e_test.go`. Follow the existing pattern:
+   `t.TempDir()` per test, `envlessRun(t, dir, stdin, args...)`,
+   assert on stdout/stderr/exit code.
+
+Table-driven where it pays off:
+
+```go
+func TestParse(t *testing.T) {
+    cases := []struct {
+        name string
+        in   string
+        want []Entry
+    }{
+        {"empty", "", nil},
+        {"single", "A=1\n", []Entry{{"A", "1"}}},
+        // ...
+    }
+    for _, tc := range cases {
+        t.Run(tc.name, func(t *testing.T) {
+            got, err := Parse([]byte(tc.in))
+            if err != nil { t.Fatal(err) }
+            if !reflect.DeepEqual(got, tc.want) {
+                t.Fatalf("got %v, want %v", got, tc.want)
+            }
+        })
+    }
+}
+```
+
+### What to assert in e2e
+
+- **Exit code** — see [Exit codes](/envless/cli/#exit-codes).
+- **Stdout content**. The caveman convention means it is predictable.
+- **File side-effects** — `.envless/`, `secrets/`, `.gitignore`.
+- **Never** assert on the encrypted bytes of `secrets/*.env.enc`
+  directly — sops includes timestamps and per-call randomness.
+
+### What NOT to do
+
+- **No mocks for `sops` or `age`.** They are real binaries; the e2e
+  suite uses them. Mocking the boundary defeats the test's purpose.
+- **No `t.Sleep`** to "wait for sops to finish." `exec.Cmd.Run()` is
+  synchronous. If you find yourself wanting a sleep, look harder.
+- **No global fixtures** beyond what `TestMain` sets up. Each test
+  gets its own `t.TempDir()`.
+- **No flaky network calls.** v0.0.1 makes none — keep it that way.
+
+### Suite-time budget
+
+We target sub-3-second `go test ./...` because slow tests stop
+getting run. The e2e cases that shell out to `sops` each take
+~200ms; that is the budget, not a license to add more. If a new
+case takes longer than 500ms, profile it.
+
+## Release process
+
+`envless` releases on Git tags. The process is largely automated by
+[GoReleaser][gr] and GitHub Actions. The current flow plus the
+intended automated flow (once Workstream B closes) are documented
+here side-by-side.
+
+### Current release flow (`v0.0.1`)
+
+The pipeline ([`.github/workflows/release.yml`][gh-release-yml])
+triggers on `push: tags: ['v*']`:
+
+1. Check out at depth 0 (so goreleaser can read the full history).
+2. Set up Go 1.26.
+3. Run `goreleaser release --clean` with `GITHUB_TOKEN` from the
+   workflow.
+
+GoReleaser ([`.goreleaser.yaml`][gh-goreleaser]) emits, for each
+`{linux,darwin} × {amd64,arm64}`:
+
+- A static binary built with `CGO_ENABLED=0 -trimpath -ldflags "-s
+  -w -X main.version=<tag>"`.
+- A `.tar.gz` archive named
+  `envless_<version>_<os>_<arch>.tar.gz`.
+- A `checksums.txt` with SHA-256 of every archive.
+
+The release is created as a **draft** (`release.draft: true`). A
+maintainer flips it to "Published" once the assets are verified.
+
+### Cutting a release locally
+
+```bash
+# 1. Make sure main is green and the changes you want are in.
+git checkout main && git pull
+make test
+
+# 2. Bump the spec / docs as needed, then tag.
+git tag v0.0.2
+git push origin v0.0.2
+
+# 3. Watch the release workflow finish, then publish the draft on
+#    https://github.com/biliboss/envless/releases.
+```
+
+The docs site is rebuilt by [`docs.yml`][gh-docs-yml] on the next
+push to `main` (or via `workflow_dispatch`). The Changelog page
+picks up the new release from the GH API; no doc edits required.
+
+### Intended automated flow (Workstream B)
+
+The end state is a single tag push that produces:
+
+1. Cross-built binaries (today).
+2. **Bench artifacts** — `bench/run.sh` runs against the release SHA
+   on a known runner and commits the result to
+   `bench/results/<sha>.json` on `main`.
+3. **A published GitHub Release** (no draft, signed assets).
+4. **Docs site rebuild** — picks up the release entry, joins to the
+   bench JSON, renders the perf delta inline.
+
+The proposed `release.yml` once Workstream B lands:
+
+```yaml
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest      # consistent runner = consistent numbers
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.26' }
+      - run: sudo apt-get install -y hyperfine
+      - run: ./bench/run.sh
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "bench: record results for ${{ github.ref_name }}"
+          file_pattern: bench/results/*.json
+          branch: main
+
+  goreleaser:
+    needs: bench
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.26' }
+      - uses: goreleaser/goreleaser-action@v6
+        with: { args: release --clean }
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+```
+
+Once that workflow exists, the only manual step in a release is the
+tag push.
+
+### Versioning policy
+
+Pre-1.0: SemVer-shaped but not SemVer-binding. The CLI surface is
+allowed to break between minor versions. File-format compatibility
+is guaranteed within `0.x` — a `secrets/dev.env.enc` written by
+`0.0.1` will decrypt under `0.1`.
+
+Post-1.0: full SemVer. Breaking changes to the CLI or file format
+require a major bump.
+
+### Changelog discipline
+
+The release notes you write on the GitHub Release page become the
+Changelog page. Keep them:
+
+- **Conventional-commits styled** — `feat:`, `fix:`, `docs:`,
+  `chore:`, `BREAKING:`.
+- **Linkable** — reference issue / PR numbers.
+- **Concise** — the perf delta table is rendered automatically; you
+  do not need to restate it in prose.
+
+[sops-releases]: https://github.com/getsops/sops/releases
+[gh-makefile]: https://github.com/biliboss/envless/blob/main/Makefile
+[gh-docs-yml]: https://github.com/biliboss/envless/blob/main/.github/workflows/docs.yml
+[gh-ci]: https://github.com/biliboss/envless/blob/main/.github/workflows/ci.yml
+[gh-e2e]: https://github.com/biliboss/envless/blob/main/e2e/e2e_test.go
+[gr]: https://goreleaser.com/
+[gh-release-yml]: https://github.com/biliboss/envless/blob/main/.github/workflows/release.yml
+[gh-goreleaser]: https://github.com/biliboss/envless/blob/main/.goreleaser.yaml

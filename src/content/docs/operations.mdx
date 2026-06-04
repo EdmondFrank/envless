@@ -1,0 +1,410 @@
+---
+title: Operations
+description: The day-two surface. Onboarding teammates, managing the recipients file, surviving disasters, and wiring envless into GitHub Actions / GitLab CI / Docker.
+---
+
+`envless` is file-based, so day-two operations are largely Git
+operations plus a small set of key-management steps. This page covers
+the four scenarios you will hit: onboarding a teammate, reviewing
+recipient changes, recovering from a disaster, and integrating with
+CI/CD.
+
+## Team onboarding
+
+`envless` treats every team member as a public key. Onboarding is one
+PR: the newcomer generates an identity, posts their pubkey, and the
+existing team re-encrypts to include them.
+
+### The newcomer's side
+
+```bash
+# 1. Clone the repo.
+git clone git@github.com:org/repo.git
+cd repo
+
+# 2. Generate a local identity. The repo already has secrets/*.env.enc
+#    and .envless/recipients — your `init` only creates your own
+#    keypair if missing.
+envless init
+
+# 3. Print your pubkey so you can paste it into a PR.
+grep "public key" .envless/identity.key
+# → # public key: age1abcd...
+```
+
+The newcomer does not yet have decrypt access — their pubkey is not in
+`.envless/recipients`.
+
+### The team's side
+
+A maintainer adds the newcomer's pubkey and re-encrypts.
+
+```bash
+# 1. Append the new pubkey.
+echo "age1abcd..." >> .envless/recipients
+
+# 2. Re-encrypt every env so the new recipient is in the data-key
+#    wrap. v0.0.1 has no `envless re-encrypt`; the portable approach:
+for env in dev prod; do
+  for key in $(envless list --env="$env"); do
+    val=$(envless get "$key" --env="$env" --confirm)
+    printf '%s' "$val" | envless set "$key" --env="$env"
+  done
+done
+
+# 3. Commit.
+git checkout -b onboard-alice
+git add .envless/recipients secrets/
+git commit -m "onboard alice: add recipient + re-encrypt envs"
+git push -u origin onboard-alice
+gh pr create --fill
+```
+
+The PR diff makes the change auditable: one new line in `recipients`
+and N changed lines in `secrets/*.env.enc`. The encrypted-bytes diff
+is noise, but the `recipients` diff is human-readable and reviewable.
+
+After merge, the newcomer pulls and runs `envless list` to confirm
+decrypt access.
+
+### Onboarding agents and CI runners
+
+Identical pattern with a different name on the pubkey. Agents and CI
+get their own keypairs — never share a human's identity with a bot.
+
+```bash
+# On the CI runner (or one-shot, key stored in GH Actions secret):
+age-keygen -o /tmp/ci-identity.key
+PUBKEY=$(grep "public key" /tmp/ci-identity.key | awk '{print $4}')
+# Add PUBKEY to .envless/recipients via PR.
+# Store /tmp/ci-identity.key contents as the GH secret AGE_IDENTITY.
+```
+
+See [CI/CD integration](#cicd-integration-patterns) below for the
+workflow side.
+
+### Anti-patterns to avoid
+
+- **One identity for the whole team.** Defeats per-recipient
+  revocation.
+- **Committing `identity.key`.** It is gitignored by default;
+  double-check before pushing.
+- **Sending pubkeys over Slack as the source of truth.** The
+  `.envless/recipients` PR is the source. Slack is a notification
+  channel, not an audit trail.
+- **Adding a pubkey without re-encrypting.** Until you re-encrypt,
+  the new recipient cannot decrypt anything. The PR should bundle
+  both changes.
+
+### Tooling improvements coming in v0.1
+
+- `envless team add alice@org --pubkey=age1...` — one-command
+  recipient addition.
+- `envless team revoke alice@org` — removal + automatic re-encrypt.
+- `.envless/team.yaml` — per-env recipient lists with role names.
+
+Until then, the manual flow above is the supported workflow.
+
+## Recipient management
+
+`.envless/recipients` is the access-control plane for `envless`.
+Every encrypted file is encrypted to the keys listed here. Adding a
+line grants future read access; removing a line stops future writes
+from including the recipient — but does not retroactively redact past
+encryptions.
+
+### Format
+
+Plain text, one [age] public key per line. Lines starting with `#`
+are comments. Blank lines are ignored.
+
+```
+# Humans
+age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p  # alice
+age1z6f0ldygfp22k0w50zss5pl4kxvkzlulhpqcmm8m65rt6q08vrnsq8ec6t  # bob
+
+# CI
+age1mh6gh39mhqaeu2cysr0gwz2ts83krppyzj8nrz86g2yax7gx7scqgca2x9  # gh-actions-deploy
+```
+
+Comments are useful for owner labels but are not part of the access
+decision — `sops` only sees the keys.
+
+### Source-of-truth semantics
+
+The file in the default branch of the repository is authoritative.
+A local edit means nothing until it lands in `main`. This is by
+design: PR review is the access-control workflow.
+
+The parser ([`store.Recipients()`][gh-store]) treats lines like this:
+
+```go
+for _, line := range strings.Split(string(data), "\n") {
+    line = strings.TrimSpace(line)
+    if line == "" || strings.HasPrefix(line, "#") {
+        continue
+    }
+    out = append(out, line)
+}
+```
+
+A trailing inline `# comment` on the same line as a pubkey is **kept
+as part of the key**. Put comments on their own line.
+
+If the file is empty after stripping comments, every encryption call
+fails with `store: no recipients in <path>`.
+
+### Reviewing changes
+
+Diffs to `.envless/recipients` are the moment to slow down. A PR
+that touches this file should pass a checklist:
+
+- Does the PR identify the human/agent/CI runner behind each new key?
+- Does the same PR re-encrypt every `secrets/*.env.enc`? (See
+  [Onboarding](#team-onboarding) above for the loop.)
+- For removals: have the corresponding secrets been rotated upstream
+  (see [Security → Rotation](/envless/security/#key-rotation--compromise-response))?
+
+A CODEOWNERS rule pinning `.envless/**` to a security reviewer is a
+good template for teams larger than three.
+
+### Multi-environment caveat (v0.0.1)
+
+Today there is one `.envless/recipients` file for the entire repo.
+Every env (`dev`, `staging`, `prod`) uses the same recipient list. If
+you need per-env access — e.g. ops sees prod, devs see dev — you have
+two interim options:
+
+1. **Two repos.** One per trust tier. Crude but secure.
+2. **Wait for v0.1's `.envless/team.yaml`** which introduces per-env
+   recipient roles.
+
+### Programmatic listing
+
+```bash
+# Stable, scriptable list of pubkeys
+grep -v '^#' .envless/recipients | grep -v '^$' | awk '{print $1}'
+```
+
+`envless` itself does not yet expose `envless recipients list` — that
+is a v0.1 convenience.
+
+## Disaster recovery
+
+`envless` is file-based, so disaster recovery is largely Git recovery
+plus a small set of key-management steps. The scenarios below cover
+the realistic failure modes.
+
+### Scenario 1 — Identity file lost (no leak)
+
+You deleted `.envless/identity.key`, or it lived on a wiped laptop,
+but you have no reason to believe anyone else has a copy.
+
+1. On a fresh checkout, run `envless init`. A new identity is generated.
+2. Get a teammate (or any existing recipient) to add your new pubkey
+   to `.envless/recipients` and re-encrypt — see
+   [Team onboarding](#team-onboarding).
+
+You temporarily lose the ability to decrypt until step 2 lands. The
+encrypted data is intact.
+
+### Scenario 2 — Identity file leaked
+
+Assume the worst: someone has a copy of `.envless/identity.key`.
+
+1. **Rotate every secret value** at the upstream provider. The leaked
+   key can decrypt all current and historical encrypted files in Git.
+   See [Security → Rotation](/envless/security/#key-rotation--compromise-response).
+2. **Remove the leaked pubkey** from `.envless/recipients`.
+3. **Generate a new identity** (`envless init` after `rm
+   .envless/identity.key`) and add it to recipients.
+4. **Re-encrypt every env** with the new recipient set.
+5. **Communicate to the team** — the leaked identity is permanently
+   useless after step 1, but document the timeline.
+
+Do NOT skip step 1. Revoking the recipient stops future encryptions
+from including the leaked key, but the attacker already has copies of
+the encrypted files via Git history.
+
+### Scenario 3 — Last remaining identity holder is gone
+
+The only person who could decrypt left, and they're not reachable.
+
+If no other recipient has access, **the secrets are unrecoverable
+from the encrypted files**. This is by design — there is no backdoor.
+Your recovery path:
+
+1. Recover secret values from their upstream sources (provider
+   dashboards, prior `.env` backups, the team password manager, etc.).
+2. Initialize a fresh envless state on a clone:
+   ```bash
+   rm -rf .envless secrets
+   envless init
+   # then `envless set` each recovered value
+   ```
+3. Commit and force-push, or replace history if your repo policy
+   requires it.
+
+**Mitigation**: always keep at least two recipients with decrypt
+access — e.g. one human and one bot identity stored encrypted in a
+password manager.
+
+### Scenario 4 — Repository gone (host loss)
+
+Git is distributed. Any team member who pulled recently has the
+encrypted files locally. To recover:
+
+1. Identify the most recent clone.
+2. `git push --mirror` to a new remote.
+3. Resume normal operation.
+
+The `.envless/identity.key` files are *not* in Git, so each
+developer's local copy is still valid against the recovered repo.
+
+### Scenario 5 — Corrupted `secrets/<env>.env.enc`
+
+The file fails to decrypt — `sops` errors with MAC mismatch or YAML
+parse failure.
+
+1. `git log -p secrets/<env>.env.enc` — find the last known-good
+   commit.
+2. `git checkout <good-sha> -- secrets/<env>.env.enc`.
+3. Decrypt and commit. The intervening encrypted edits are lost;
+   merge from a teammate's working copy if they have newer values.
+
+If no good commit exists in history (e.g. a bad commit landed in
+main weeks ago and propagated), follow Scenario 3 — recover from
+upstream sources.
+
+### Backups worth keeping
+
+- `.envless/identity.key` in an offline password manager (1Password,
+  Bitwarden) per identity holder.
+- Periodic `git bundle create` of the repo, stored off-host, if your
+  Git host is the only copy.
+
+The encrypted files in Git are not sensitive on their own — they are
+just bytes. The keys are.
+
+## CI/CD integration patterns
+
+`envless` shines in CI: the pipeline holds one age secret key, and
+every encrypted file in the repo is suddenly readable. No
+per-environment env-var maze, no drift between local `.env` and
+`gh secrets`.
+
+The integration shape is the same on every CI:
+
+1. Generate a **CI bot identity** (an age keypair).
+2. Add its pubkey to `.envless/recipients` and re-encrypt.
+3. Store the **secret key** as a single CI-provider secret
+   (`AGE_IDENTITY` or similar).
+4. In the workflow, write that secret to a temp file and point
+   `envless` at it.
+
+### GitHub Actions
+
+```yaml
+# .github/workflows/deploy.yml
+name: deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install age + sops
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y age
+          curl -sSfL -o /tmp/sops \
+            https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64
+          sudo install -m 0755 /tmp/sops /usr/local/bin/sops
+
+      - name: install envless
+        run: |
+          curl -sSfL https://github.com/biliboss/envless/releases/latest/download/envless_linux_amd64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin envless
+
+      - name: provision identity from secret
+        run: |
+          mkdir -p .envless
+          umask 077
+          printf '%s' "${{ secrets.AGE_IDENTITY }}" > .envless/identity.key
+
+      - name: deploy with secrets injected
+        run: envless exec --env=prod -- npm run deploy
+```
+
+The `envless exec` line is the only place secrets enter the build —
+they live inside the deploy step's child process only.
+
+### GitLab CI
+
+```yaml
+deploy:
+  image: alpine:3.20
+  before_script:
+    - apk add --no-cache age curl
+    - curl -sSfL -o /tmp/sops https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64
+    - install -m 0755 /tmp/sops /usr/local/bin/sops
+    - curl -sSfL https://github.com/biliboss/envless/releases/latest/download/envless_linux_amd64.tar.gz | tar -xz -C /usr/local/bin envless
+    - mkdir -p .envless && umask 077 && printf '%s' "$AGE_IDENTITY" > .envless/identity.key
+  script:
+    - envless exec --env=prod -- ./deploy.sh
+  variables:
+    AGE_IDENTITY: $AGE_IDENTITY     # masked CI/CD variable
+```
+
+### Arbitrary Docker-based pipeline
+
+Same shape, in a Dockerfile:
+
+```dockerfile
+FROM golang:1.26-alpine AS build
+RUN apk add --no-cache age curl \
+    && curl -sSfL -o /usr/local/bin/sops https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64 \
+    && chmod +x /usr/local/bin/sops
+RUN curl -sSfL https://github.com/biliboss/envless/releases/latest/download/envless_linux_amd64.tar.gz | tar -xz -C /usr/local/bin envless
+
+WORKDIR /src
+COPY . .
+RUN --mount=type=secret,id=age_identity \
+    mkdir -p .envless \
+    && cp /run/secrets/age_identity .envless/identity.key \
+    && chmod 0600 .envless/identity.key \
+    && envless exec --env=prod -- make build
+```
+
+Build with `docker build --secret id=age_identity,src=$HOME/.config/envless/ci.key .`.
+
+### Hardening tips
+
+- **One bot identity per pipeline** — separate keys for `staging` and
+  `prod`. Lets you revoke independently.
+- **No `envless get` in CI.** Use `envless exec` so plaintext only
+  exists in the child process's env, never in CI logs.
+- **`umask 077` before writing the identity file** — defaults vary
+  across runners; this is one line of insurance.
+- **Mask the `AGE_IDENTITY` secret.** Every major CI provider
+  supports this; it scrubs accidental echo from logs.
+- **Pin sops + age versions** — let the workflow break on upgrade
+  rather than silently picking up a new release.
+
+### What v0.1 will simplify
+
+- `envless-ci-github` plugin — emits the workflow snippet above for
+  you.
+- `envless ci provision` — single command that creates a bot
+  identity, prints the pubkey, and outputs the secret value to paste
+  into `gh secret set`.
+
+Until then, the snippets above are the supported pattern.
+
+[age]: https://age-encryption.org/v1
+[gh-store]: https://github.com/biliboss/envless/blob/main/internal/store/store.go

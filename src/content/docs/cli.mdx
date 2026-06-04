@@ -1,0 +1,462 @@
+---
+title: CLI reference
+description: Every subcommand, every flag, every exit code, every file format envless touches, and every environment variable it reads or sets. The single source of truth.
+---
+
+`envless` has six subcommands plus a root version flag. The surface
+is deliberately flat — no nested groups, no hidden commands.
+
+```
+envless --version
+
+envless init
+envless set    KEY                        [--env=ENV]
+envless get    KEY                        [--env=ENV] --confirm
+envless list                              [--env=ENV]
+envless exec                              [--env=ENV] -- CMD [ARGS...]
+envless migrate FILE                      [--env=ENV] [--keep]
+```
+
+Default for `--env` is always `dev`.
+
+## Subcommands
+
+### `envless --version`
+
+Prints the version baked into the binary at build time
+(`-ldflags "-X main.version=…"`). Exits 0.
+
+```
+$ envless --version
+envless version v0.0.1
+```
+
+### `envless init`
+
+Creates the `.envless/` directory and a local age identity.
+Idempotent — re-running with an existing `identity.key` is a no-op.
+
+- Creates `.envless/` with mode `0700`.
+- Runs `age-keygen -o .envless/identity.key`.
+- Chmods the key file to `0600`.
+- Writes the new pubkey as the sole line of `.envless/recipients`.
+
+Output:
+
+```
+INIT  identity=.envless/identity.key pubkey=age1...
+```
+
+Takes no positional args. Fails if `age-keygen` is not on `PATH`.
+
+### `envless set KEY`
+
+Reads the value from **stdin** (the trailing `\n` is stripped) and
+writes it to the encrypted store for `--env=ENV`.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--env` | `dev` | Target environment name. Becomes the prefix of `secrets/<env>.env.enc`. |
+
+Output:
+
+```
+SET   env=dev key=OPENAI_API_KEY
+```
+
+The value never appears on stdout or stderr. Read-modify-write of the
+existing env file under the hood.
+
+### `envless get KEY`
+
+Prints the plaintext value. Requires `--confirm` — printing a secret
+must be intentional.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--env` | `dev` | Target environment. |
+| `--confirm` | `false` | Required. Without it, the command errors out with `printing a secret requires --confirm` (exit 1). |
+
+Output (with `--confirm`):
+
+```
+sk-test-xyz
+```
+
+If the key is missing for the given env, exit 1 with:
+`key "OPENAI_API_KEY" not found in env "dev"`.
+
+For programmatic reads, prefer `envless exec` so the plaintext does
+not hit a shell.
+
+### `envless list`
+
+Prints all keys for the env, one per line, sorted alphabetically.
+Values are never printed.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--env` | `dev` | Target environment. |
+
+Output:
+
+```
+A
+B
+OPENAI_API_KEY
+URL
+```
+
+Empty output (exit 0) means no env file or no keys yet.
+
+### `envless exec [--env=ENV] -- CMD [ARGS...]`
+
+The star command. Decrypts the env file, merges its KV map into
+`os.Environ()` (env-file keys override the parent), sorts the merged
+list, spawns `CMD` with that environment, and proxies stdin/stdout/
+stderr.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--env` | `dev` | Target environment. |
+
+The `--` separator is conventional but not strictly required by
+cobra; include it to avoid ambiguity with envless's own flags.
+
+Exit code: child's exit code on a clean run. See
+[Exit codes](#exit-codes) below for failure modes.
+
+Example:
+
+```bash
+envless exec -- node server.js
+envless exec --env=prod -- npm run deploy
+envless exec -- /bin/sh -c 'echo $OPENAI_API_KEY'
+```
+
+### `envless migrate FILE`
+
+One-shot migration from a plaintext `.env`-style file to an encrypted
+env. Idempotently amends `.gitignore`.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--env` | `dev` | Target environment. |
+| `--keep` | `false` | If set, the plaintext source file is **not** removed after migration. |
+
+Behaviour:
+
+1. Reads `FILE`, parses via [`pkg/envparse`][gh-envparse] (handles
+   `KEY=VALUE`, quoted values, trailing `# comments`).
+2. Merges into the existing env file (last-write-wins on duplicate
+   keys; migration overrides).
+3. Encrypts via `sops`.
+4. Appends `basename(FILE)` to `.gitignore` (idempotent; skipped if
+   the pattern is already present).
+5. Removes `FILE` unless `--keep`.
+
+Output (without `--keep`):
+
+```
+MIGRATE  src=.env env=dev keys=3
+REMOVE   .env
+```
+
+## Exit codes
+
+`envless` follows Unix conventions: `0` on success, non-zero on
+failure. The two interesting nuances are `exec`, which propagates the
+child's exit code verbatim, and `get`, which fails fast without
+`--confirm`.
+
+| Code | Where it comes from | Meaning |
+|---|---|---|
+| `0` | every subcommand | success |
+| `1` | cobra / envless wrapper | unhandled error (missing arg, parse failure, file not found, sops error, `get` without `--confirm`, etc.) |
+| **N** | `envless exec` | child process exited with code N (propagated via [`execenv.ExitError`][gh-execenv]) |
+| `127` | shell or OS | binary not found on `PATH` — comes from the shell, not from `envless` |
+
+### Behaviour by subcommand
+
+- **`envless --version`** — `0` always (assuming the binary launched
+  at all).
+- **`envless init`** — `0` on success or no-op (identity already
+  exists). `1` if `age-keygen` is missing or fails. Stderr includes
+  `store: age-keygen: ...` and the captured `age-keygen` stderr.
+- **`envless set`** — `0` on success. `1` if stdin read fails, if
+  recipients file is empty, or if `sops encrypt` errors.
+- **`envless get`** — `0` and prints the value on success. `1` if
+  `--confirm` is absent (stderr: `printing a secret requires
+  --confirm`). `1` if the key is not in the env (stderr: `key "X"
+  not found in env "Y"`). `1` if `sops decrypt` errors.
+- **`envless list`** — `0` on success, including the empty-set case.
+  `1` on decrypt or store errors.
+- **`envless exec`** — **child exit code**, verbatim, when the child
+  runs and exits normally or with an error code. `envless` itself
+  does not interpret the code. `1` if `--` is followed by no command
+  (`exec: missing command`). `1` if decryption fails before the
+  child starts. Shell-level `127` if the command binary is not
+  found — that is the OS exec failure, not an `envless` exit. The
+  Go `os/exec` package surfaces this as `*exec.ExitError`, which
+  envless wraps and exits with `1`.
+- **`envless migrate`** — `0` on success (and on `--keep`). `1` if
+  the source file is missing, unreadable, fails to parse, or the
+  encrypt step fails.
+
+### Implementation reference
+
+The `exec` propagation is the only non-trivial case. From
+[`internal/ecmd/exec.go`][gh-exec]:
+
+```go
+runErr := execenv.Run(args, child, os.Stdin, cmd.OutOrStdout(), cmd.ErrOrStderr())
+if runErr == nil {
+    return nil
+}
+var xe *execenv.ExitError
+if errors.As(runErr, &xe) {
+    os.Exit(xe.Code)
+}
+return runErr
+```
+
+And the `ExitError` definition from [`internal/execenv`][gh-execenv]:
+
+```go
+type ExitError struct{ Code int }
+func (e *ExitError) Error() string { return fmt.Sprintf("exit status %d", e.Code) }
+```
+
+Any non-`ExitError` returned from the run path bubbles up to the
+cobra default handler, which prints to stderr and exits `1`.
+
+### Scripting against `envless exec`
+
+Because `exec` propagates exactly, the common shell idiom works:
+
+```bash
+envless exec -- ./run-tests.sh
+echo "tests exited $?"
+```
+
+Or, for fail-fast pipelines:
+
+```bash
+set -euo pipefail
+envless exec -- ./run-tests.sh
+envless exec -- ./deploy.sh
+```
+
+## Environment variables
+
+`envless` is configured almost entirely by files and flags. It reads
+exactly one external env var, sets one for child processes (`sops`
+decryption), and forwards every variable in the parent's environment
+into `exec` children.
+
+### Read by envless
+
+| Variable | Read by | Purpose |
+|---|---|---|
+| `PATH` | OS / `os/exec` | Locating `age-keygen` and `sops`. Standard `exec.LookPath` semantics. |
+
+That is the entire intentional read set in v0.0.1. Anything else
+cobra or the Go runtime touches (`HOME`, `TMPDIR`) is incidental and
+not part of the contract.
+
+### Set by envless (for child processes)
+
+| Variable | Set by | Purpose |
+|---|---|---|
+| `SOPS_AGE_KEY_FILE` | `internal/sopswrap.Decrypt` | Points sops at `.envless/identity.key`. Set only on the `sops decrypt` child process — not exported to your shell. |
+
+The `sops` call ([`sopswrap.go`][gh-sopswrap]) builds its env like
+so:
+
+```go
+cmd.Env = append(os.Environ(), "SOPS_AGE_KEY_FILE="+identityFile)
+```
+
+So `SOPS_AGE_KEY_FILE` overrides any inherited value for the duration
+of the decrypt.
+
+### Forwarded into `envless exec` children
+
+`envless exec` constructs the child env by merging:
+
+- Every `KEY=VALUE` from `os.Environ()` (the envless process's
+  parent env).
+- Every entry from the decrypted secrets map. Secrets override
+  matching parent keys.
+
+The merged set is sorted lexicographically and passed as `cmd.Env`.
+The merge logic is in [`internal/execenv.BuildEnv`][gh-execenv]:
+
+```go
+merged := map[string]string{}
+for _, e := range parent {
+    k, v, ok := strings.Cut(e, "=")
+    if !ok { continue }
+    merged[k] = v
+}
+for k, v := range kv {
+    merged[k] = v
+}
+```
+
+Note: secrets win. If your shell exports `OPENAI_API_KEY=local` and
+the env file contains `OPENAI_API_KEY=sops`, the child sees `sops`.
+
+### Variables NOT defined by envless
+
+For clarity, `envless` does **not** read or honour any of the
+following — listed because users sometimes expect them by analogy
+with sops, dotenv-vault, or direnv:
+
+- `ENVLESS_HOME`, `ENVLESS_CONFIG`, `ENVLESS_NO_COLOR`, etc. — not
+  implemented.
+- `SOPS_AGE_RECIPIENTS` — sops respects this for encryption, but
+  `envless` always reads recipients from `.envless/recipients`, so
+  setting `SOPS_AGE_RECIPIENTS` has no effect on `envless`-mediated
+  calls.
+- `AGE_IDENTITY` — convention for storing the secret key in CI, but
+  `envless` does not read it directly. Materialise the file (see
+  [Operations → CI/CD](/envless/operations/#cicd-integration-patterns)).
+
+## File formats
+
+`envless` operates on five files. Knowing their format makes manual
+debugging and recovery trivial.
+
+### `.envless/identity.key`
+
+The age secret key. Generated by `age-keygen` on `envless init`.
+
+- **Format:** age private-key file, three lines:
+  ```
+  # created: 2026-01-01T00:00:00Z
+  # public key: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+  AGE-SECRET-KEY-1XQ...
+  ```
+- **Mode:** `0600` (enforced by `envless`).
+- **Git:** `.gitignore` includes `.envless/identity.key` by default.
+- **Read by:** `envless` (`store.PubKey()`), `sops` (via
+  `SOPS_AGE_KEY_FILE`).
+
+The pubkey is extracted by scanning for the `# public key: ` marker
+— this is part of the age file format and stable across versions.
+
+### `.envless/recipients`
+
+The access-control list. One [age] public key per line.
+
+- **Format:** UTF-8 text. Blank lines and `# comments` ignored.
+- **Mode:** `0644` (committed).
+- **Git:** committed.
+- **Read by:** `envless` (`store.Recipients()`), passed to
+  `sops encrypt --age <comma-separated>`.
+
+Example:
+
+```
+# Humans
+age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p  # alice
+age1z6f0ldygfp22k0w50zss5pl4kxvkzlulhpqcmm8m65rt6q08vrnsq8ec6t  # bob
+# CI
+age1mh6gh39mhqaeu2cysr0gwz2ts83krppyzj8nrz86g2yax7gx7scqgca2x9
+```
+
+A pubkey with a trailing inline comment on the same line is treated
+as a single token by [`store.Recipients()`][gh-store] — put comments
+on their own line. Empty file = the next encrypt operation fails with
+`store: no recipients`.
+
+### `secrets/<env>.env.enc`
+
+The encrypted secret store. Output of `sops encrypt --input-type
+dotenv --output-type dotenv`.
+
+- **Format:** sops dotenv envelope. Plain key names + AES-GCM
+  encrypted values + sops metadata block at the end:
+  ```
+  OPENAI_API_KEY=ENC[AES256_GCM,data:...]
+  STRIPE_KEY=ENC[AES256_GCM,data:...]
+  sops_age__list_0__map_recipient=age1...
+  sops_age__list_0__map_enc=-----BEGIN AGE ENCRYPTED FILE-----...
+  sops_lastmodified=2026-01-01T00:00:00Z
+  sops_mac=ENC[AES256_GCM,data:...]
+  sops_unencrypted_suffix=_unencrypted
+  sops_version=3.9.4
+  ```
+- **Mode:** `0644`.
+- **Git:** committed.
+- **Read by:** `sops decrypt` (with `SOPS_AGE_KEY_FILE`).
+
+Plaintext form before encryption (rendered by
+[`sopswrap.renderDotenv`][gh-sopswrap]):
+
+- Sorted keys (lexicographic, byte-wise).
+- `KEY=VALUE\n` per line.
+- No quoting. Values containing `\n` will break the dotenv format —
+  treat them as out of scope for v0.0.1.
+
+### `.gitignore`
+
+`envless migrate` appends the source filename, idempotently.
+
+- **Format:** standard gitignore.
+- **Behaviour:** the migrate command reads `.gitignore`, splits on
+  `\n`, trims whitespace, and skips if a line equals `basename(src)`.
+  Else appends `<basename>\n` (with a leading newline if the file
+  did not end with one).
+
+The repo ships with the following lines pre-set:
+
+```
+.envless/identity.key
+.envless/inbox/
+.astro/
+dist/
+node_modules/
+```
+
+### `.env` (input only)
+
+The plaintext source for `envless migrate`. Parsed by
+[`pkg/envparse`][gh-envparse]:
+
+- One assignment per line: `KEY=VALUE`.
+- `#`-prefixed lines and blank lines: ignored.
+- Quoted values (`"..."` or `'...'`): unquoted, no escape sequences
+  interpreted. Quotes must close on the same line.
+- Unquoted values: trailing ` # comment` (space + `#`) is stripped.
+- No `$VAR` interpolation. No multi-line values.
+
+If a value contains characters that round-trip through dotenv badly
+(newlines, NUL bytes), behaviour is undefined. v0.0.1 keeps the
+parser deliberately small; richer parsing lands in v0.1.
+
+## Implementation pointers
+
+| Subcommand | Source |
+|---|---|
+| `init` | [`internal/ecmd/init.go`][gh-init] |
+| `set` | [`internal/ecmd/set.go`][gh-set] |
+| `get` | [`internal/ecmd/get.go`][gh-get] |
+| `list` | [`internal/ecmd/list.go`][gh-list] |
+| `exec` | [`internal/ecmd/exec.go`][gh-exec] |
+| `migrate` | [`internal/ecmd/migrate.go`][gh-migrate] |
+| root wiring | [`internal/ecmd/root.go`][gh-root] |
+
+[age]: https://age-encryption.org/v1
+[gh-envparse]: https://github.com/biliboss/envless/blob/main/pkg/envparse/envparse.go
+[gh-init]: https://github.com/biliboss/envless/blob/main/internal/ecmd/init.go
+[gh-set]: https://github.com/biliboss/envless/blob/main/internal/ecmd/set.go
+[gh-get]: https://github.com/biliboss/envless/blob/main/internal/ecmd/get.go
+[gh-list]: https://github.com/biliboss/envless/blob/main/internal/ecmd/list.go
+[gh-exec]: https://github.com/biliboss/envless/blob/main/internal/ecmd/exec.go
+[gh-migrate]: https://github.com/biliboss/envless/blob/main/internal/ecmd/migrate.go
+[gh-root]: https://github.com/biliboss/envless/blob/main/internal/ecmd/root.go
+[gh-execenv]: https://github.com/biliboss/envless/blob/main/internal/execenv/execenv.go
+[gh-sopswrap]: https://github.com/biliboss/envless/blob/main/internal/sopswrap/sopswrap.go
+[gh-store]: https://github.com/biliboss/envless/blob/main/internal/store/store.go

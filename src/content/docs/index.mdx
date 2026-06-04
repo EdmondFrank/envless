@@ -1,67 +1,69 @@
 ---
 title: envless
-description: Agent-first secrets. Zero .env files. Zero servers.
+description: Agent-first secrets. Zero .env. Zero servers. A tiny CLI on top of age + sops that turns plaintext .env files into encrypted-in-repo secrets and injects them at fork time.
 template: splash
 hero:
-  tagline: Kill .env. Keep process.env. Skill drives setup.
+  tagline: "Kill .env. Keep process.env. One binary, age + sops underneath, nothing to log into."
   actions:
-    - text: Install
-      link: ./getting-started/install/
-      icon: right-arrow
-      variant: primary
-    - text: Latest v0.0.1
-      link: ./releases/latest/
+    - text: Quickstart
+      link: /envless/quickstart/
       icon: rocket
+      variant: primary
+    - text: Architecture
+      link: /envless/architecture/
+      icon: right-arrow
       variant: secondary
     - text: GitHub
       link: https://github.com/biliboss/envless
       icon: external
+      variant: minimal
 ---
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
 
-## What
+## What envless is
 
-`envless` is a thin Go CLI on top of [age](https://github.com/FiloSottile/age) + [sops](https://github.com/getsops/sops) that:
+A thin CLI on top of [age](https://age-encryption.org/v1) + [sops](https://getsops.io/docs/):
 
 - replaces `.env` files with encrypted-in-repo `secrets/*.env.enc`
-- preserves the `process.env.X` interface — language-agnostic via `execve`
-- treats every team member, agent, and CI runner as a first-class identity
-- ships nothing to a server, no account, no SaaS
+- preserves `process.env.KEY` — language-agnostic via `execve`
+- treats every human, agent, and CI runner as a first-class identity (one age pubkey each)
+- ships zero servers, zero accounts, zero SaaS
+
+```bash
+envless init                                 # creates .envless/identity.key
+echo "sk-test-xyz" | envless set OPENAI_API_KEY
+envless exec -- node server.js               # process.env.OPENAI_API_KEY populated
+```
+
+| | envless | .env files | HashiCorp Vault | 1Password CLI |
+|---|---|---|---|---|
+| Hosting | none (file in repo) | none | self-hosted server | hosted |
+| Account required | no | no | no | yes |
+| Encryption at rest | age + sops | none | own KMS | proprietary |
+| Process injection | `envless exec -- cmd` | manual `source` | sidecar / templates | `op run --env-file` |
+| Works offline | yes | yes | no | partial |
+| License | Apache-2.0 | n/a | BSL 1.1 | proprietary |
+
+## Where to start
 
 <CardGrid>
-  <Card title="One verb" icon="rocket">
-    `envless exec -- node app.js` — secrets injected at fork time.
+  <Card title="Quickstart" icon="rocket">
+    Install, init, set, exec — 60 seconds. [Read →](/envless/quickstart/)
   </Card>
-  <Card title="No SDK" icon="puzzle">
-    Your code keeps reading `process.env.X`. No library import.
+  <Card title="Architecture" icon="setting">
+    Data flow, lifecycle of a secret, the .env problem. [Read →](/envless/architecture/)
   </Card>
-  <Card title="Per-agent identity" icon="seti:lock">
-    Revoke by removing a pubkey. No shared password.
+  <Card title="CLI reference" icon="document">
+    Every subcommand, every flag, exit codes, file formats. [Read →](/envless/cli/)
   </Card>
-  <Card title="Caveman output" icon="document">
-    One line per action. No spinners. No banners.
-  </Card>
-</CardGrid>
-
-## Two audiences
-
-<CardGrid>
-  <Card title="For the CEO" icon="approve-check">
-    Why this exists, how it compares, what we will and won't build.
-    Start with [Positioning](./why/positioning/) and the
-    [comparison](./why/comparison/) against Vault / 1Password / Infisical.
-  </Card>
-  <Card title="For the CTO" icon="setting">
-    [Architecture](./concepts/architecture/),
-    [threat model](./security/threat-model/),
-    [CLI reference](./reference/cli/), and
-    [CI/CD patterns](./operations/cicd/).
+  <Card title="Security" icon="seti:lock">
+    Threat model, cryptography, key rotation, audit. [Read →](/envless/security/)
   </Card>
 </CardGrid>
 
 ## Status
 
-v0.0.1 — single-user core. Teams + plugins + skill in v0.1. See the
-[roadmap](./why/roadmap/) for what comes next, and the
-[changelog](./releases/changelog/) for what shipped.
+v0.0.1 — single-user core: `init`, `set`, `get`, `list`, `exec`, `migrate`. Teams + plugins + skill in v0.1. See the [roadmap](/envless/why/#roadmap) and the [changelog](/envless/changelog/).
+
+> Living docs. Every page is a single dense reference — open the sidebar, find the topic, read it once.

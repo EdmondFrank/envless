@@ -1,17 +1,36 @@
 ---
-title: All versions
-description: Compact table of every envless release, sortable newest-first.
+title: Changelog
+description: Every envless release, newest first, with release notes, benchmark deltas, and downloads. Built at site-build time from the GitHub Releases API joined to bench/history.jsonl.
 ---
 
-import { getReleases } from "../../../lib/releases.ts";
+import ReleaseCard from "../../components/ReleaseCard.astro";
+import { getReleases, getLatestRelease } from "../../lib/releases.ts";
 
 export const releases = await getReleases();
+export const latest = getLatestRelease(releases);
 
 export const pickMetric = (bench, name) =>
   bench && bench[name] ? `${bench[name].value} ${bench[name].unit}` : "—";
 
-A compact table of every release, newest first. Each row links to the
-detailed entry on the [Changelog](../changelog/).
+The list below is built at site-build time from the GitHub Releases API,
+joined to `bench/history.jsonl`. New tags appear here automatically on
+the next docs deploy — no manual updates per release. See
+[Contributing → Release process](/envless/contributing/#release-process)
+for the workflow, and [Benchmarks](/envless/benchmarks/) for the
+methodology behind the perf-delta tables.
+
+## Latest
+
+{latest === null ? (
+  <p><em>No releases have been published yet.</em></p>
+) : (
+  <ReleaseCard release={latest} />
+)}
+
+## All versions
+
+A compact table of every release, newest first. Each row jumps to the
+detailed entry below.
 
 {releases.length === 0 ? (
   <p><em>No releases have been published yet.</em></p>
@@ -30,7 +49,7 @@ detailed entry on the [Changelog](../changelog/).
       {releases.map((r) => (
         <tr style="border-bottom: 1px solid var(--sl-color-gray-6, #1f2937);">
           <td style="padding: 0.4rem 0.6rem; font-family: var(--sl-font-mono);">
-            <a href={`../changelog/#release-${r.tag}`}>{r.tag}</a>
+            <a href={`#release-${r.tag}`}>{r.tag}</a>
           </td>
           <td style="padding: 0.4rem 0.6rem; font-family: var(--sl-font-mono); color: var(--sl-color-gray-3);">
             {new Date(r.date).toISOString().slice(0, 10)}
@@ -48,4 +67,12 @@ detailed entry on the [Changelog](../changelog/).
       ))}
     </tbody>
   </table>
+)}
+
+## Full history
+
+{releases.length === 0 ? (
+  <p><em>No releases have been published yet.</em></p>
+) : (
+  releases.map((release) => <ReleaseCard release={release} />)
 )}

@@ -1,0 +1,132 @@
+---
+title: Quickstart
+description: Install age + sops + envless, then go from zero to a running process with secrets injected — 60 seconds.
+---
+
+`envless` is a Go binary that shells out to `age` and `sops`. You need
+all three. Once they are on `PATH`, the entire init-set-exec loop is
+four commands.
+
+## Install
+
+### Requirements
+
+- [age](https://github.com/FiloSottile/age) ≥ 1.2
+- [sops](https://github.com/getsops/sops) ≥ 3.9
+- macOS or Linux (Windows untested)
+
+### macOS (Homebrew)
+
+```bash
+brew install age sops
+```
+
+### Linux
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install age
+curl -sSfL -o /tmp/sops https://github.com/getsops/sops/releases/latest/download/sops-v3.9.4.linux.amd64
+sudo install -m 0755 /tmp/sops /usr/local/bin/sops
+
+# Arch
+sudo pacman -S age sops
+```
+
+### `envless` itself
+
+Clone + build until binaries are published:
+
+```bash
+git clone https://github.com/biliboss/envless.git
+cd envless
+make build
+sudo install -m 0755 bin/envless /usr/local/bin/envless
+```
+
+### Verify
+
+```bash
+envless --version       # → v0.0.1
+age --version           # → v1.3.x
+sops --version          # → 3.x
+```
+
+If all three print, you're ready.
+
+## 60-second walkthrough
+
+```bash
+cd my-project
+
+envless init                                 # creates .envless/identity.key
+echo "sk-test-xyz" | envless set OPENAI_API_KEY
+
+envless list                                 # → OPENAI_API_KEY
+envless exec -- node server.js               # process.env.OPENAI_API_KEY populated
+```
+
+That's it. Your code keeps using `process.env.OPENAI_API_KEY`. No
+library import. No `.env` on disk.
+
+## Multi-env
+
+`dev` is the default. Add `prod`:
+
+```bash
+echo "sk-prod-xyz" | envless set OPENAI_API_KEY --env=prod
+envless exec --env=prod -- npm run deploy
+```
+
+Recipients per env are deferred to v0.1 (`.envless/team.yaml`). For
+v0.0.1, all envs share the local identity.
+
+## Migrate from `.env`
+
+```bash
+envless migrate .env
+# → encrypts .env → secrets/dev.env.enc
+# → removes .env
+# → adds .env to .gitignore
+```
+
+Keep the plaintext for reference (e.g. mid-migration):
+
+```bash
+envless migrate .env --keep
+```
+
+## Read a value back
+
+`get` requires `--confirm` to print plaintext. Prevents accidental
+shell-history leaks.
+
+```bash
+envless get OPENAI_API_KEY --confirm
+```
+
+For programmatic use, prefer `envless exec` — the plaintext stays
+inside the child process's env array, never on stdout.
+
+## What gets committed
+
+```
+.envless/
+  recipients          # public keys (commit)
+  identity.key        # YOUR SECRET KEY — gitignored
+
+secrets/
+  dev.env.enc         # commit (encrypted)
+  prod.env.enc        # commit (encrypted)
+
+.env                  # gitignored after migrate
+```
+
+`identity.key` is on `.envless/` ignore list automatically.
+Triple-check with `git status`.
+
+## Next
+
+- [Architecture](/envless/architecture/) — why this exists and how it works.
+- [CLI reference](/envless/cli/) — every subcommand, flag, exit code.
+- [Operations](/envless/operations/) — team onboarding, CI patterns.

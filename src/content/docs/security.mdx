@@ -1,0 +1,365 @@
+---
+title: Security
+description: What envless protects against (and doesn't), the concrete crypto primitives it uses, how to rotate keys after a leak, and how to audit the supply chain.
+---
+
+`envless` inherits its cryptographic guarantees from [age] and [sops].
+It is a thin orchestrator; it adds no new primitives, but it also adds
+no new attack surface beyond the shell-out to those binaries. This
+page walks the threat model, the concrete crypto, the rotation
+playbook, and the supply-chain surface — in that order.
+
+## Threat model
+
+### What envless protects against
+
+- **Secret leakage in commits.** Plaintext `.env` files are gone.
+  Every committed file (`secrets/*.env.enc`, `.envless/recipients`) is
+  either encrypted or a public-key list.
+- **Casual shoulder-surfing.** `envless list` prints keys but never
+  values. `envless get` requires `--confirm`. `envless exec` writes
+  secrets only into the child process's env array — never stdout.
+- **Lost laptop, no `identity.key`.** Without the age secret key,
+  encrypted files in the repo are bytes of ciphertext. Recipients can
+  be added/removed, identities revoked by re-encrypting.
+- **Drift between developer machines.** The encrypted file in Git is
+  the canonical source. There is no "what's in your local `.env`?"
+  divergence.
+- **Stale agent transcripts.** Logs containing `OPENAI_API_KEY=...`
+  are no longer possible: the variable is set inside the child
+  process, not echoed to stdout by `envless` itself.
+
+### What envless does NOT protect against
+
+These are the parts where treating `envless` as a vault would be a
+category error.
+
+- **A running process inspected via `ptrace`, `/proc/<pid>/environ`,
+  or memory dump.** Once a secret is loaded into the child's env, the
+  child's memory is fair game. Use a real cloud KMS with workload
+  identity if this is your threat.
+- **A malicious recipient.** Adding a pubkey to `.envless/recipients`
+  grants permanent access to every encrypted file from that point on.
+  Revoking the pubkey only stops *future* encryptions from being
+  readable. Anyone who held the key during the window can decrypt
+  history. Rotate secret values, not just recipients. See
+  [Rotation](#key-rotation--compromise-response).
+- **Compromised `identity.key`.** Anyone with the secret key can
+  decrypt anything encrypted to their pubkey. Treat the file as a
+  credential of last resort: `0600`, never committed, store off-host
+  if you back it up.
+- **Compromised `sops` or `age` binary.** `envless` does not verify
+  signatures on the shelled-out binaries. Pin versions, use your
+  distro's verified packages, or `cosign verify`.
+- **Side channels in your editor / shell history.** `envless get
+  --confirm` prints plaintext. So does `echo $SECRET`. If you type
+  the secret on stdin during `envless set`, your `bash` history will
+  remember `echo "..." | envless set`. Use `read -s` or paste via a
+  here-string with leading whitespace.
+- **Supply-chain attacks on Go modules.** `envless`'s direct deps are
+  three Go packages (cobra + transitive). The encryption substrate is
+  external binaries. See [Audit & supply chain](#audit--supply-chain).
+- **Plaintext logs from your application.** If your code does
+  `console.log(process.env)`, that's on you, not on `envless`.
+
+### Trust boundaries
+
+| Boundary | Who is trusted | What can they do |
+|---|---|---|
+| File at rest in repo | anyone with the repo + a recipient key | nothing without the secret key |
+| `.envless/identity.key` | the developer / agent on this machine | decrypt every env they have a recipient for |
+| `sops` + `age` binaries on `PATH` | whoever installed them | full read of plaintext during decrypt |
+| Child process spawned by `exec` | inherits the env you injected | act on the secrets per your app's code |
+
+If your operations require a tighter trust model than this — RBAC,
+auditable access, ephemeral creds — see
+[When NOT to use envless](/envless/why/#when-not-to-use).
+
+## Cryptography (age + sops)
+
+`envless` does not implement any cryptography itself. It composes two
+well-audited primitives. Knowing exactly which primitives matters for
+your security review.
+
+### age — file-level encryption
+
+[`age`][age-spec] (Actually Good Encryption) is a small format and
+tool for file encryption with multiple recipients.
+
+- **Key agreement:** X25519 for recipient keys (`age1...`).
+- **Key derivation:** HKDF-SHA256 from the X25519 shared secret.
+- **Symmetric cipher:** ChaCha20-Poly1305 (AEAD).
+- **Header format:** stanza-based, one per recipient + a single file
+  key wrapped per recipient.
+
+In `envless`, age is invoked indirectly through `sops` (sops handles
+the data-key encryption). Identity generation goes through the
+standalone `age-keygen` binary, which writes:
+
+```
+# created: 2026-01-01T00:00:00Z
+# public key: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+AGE-SECRET-KEY-1XQ...
+```
+
+`envless` scans for the `# public key: ` marker to extract the pubkey
+for the recipients file. See [`store.PubKey()`][gh-store].
+
+### sops — per-value encryption + metadata
+
+[`sops`][sops-docs] (Mozilla's Secrets OPerationS) sits on top of age
+and adds:
+
+- **Per-value encryption** with a per-file *data key*. Keys
+  (top-level field names) stay plaintext so file diffs remain
+  semantic; only values are AES-GCM encrypted.
+- **MAC** over the encrypted document for integrity (sorted-key hash).
+- **Multi-recipient data-key wrap**: the data key is encrypted once
+  per recipient (per age pubkey, in our case).
+- **Format-aware**: dotenv, YAML, JSON, INI, BINARY. `envless` uses
+  dotenv exclusively.
+
+The exact invocations `envless` uses (from
+[`internal/sopswrap`][gh-sopswrap]):
+
+```
+sops encrypt \
+  --input-type dotenv \
+  --output-type dotenv \
+  --age age1...,age1... \
+  /tmp/envless-enc-*.env
+
+sops decrypt \
+  --input-type dotenv \
+  --output-type dotenv \
+  secrets/dev.env.enc
+# with SOPS_AGE_KEY_FILE pointing at .envless/identity.key
+```
+
+Decryption reads the `SOPS_AGE_KEY_FILE` env var to locate the
+identity. This is the *only* way `envless` references its secret key
+inside a child process — never on argv.
+
+### What this means in practice
+
+- An attacker who reads `secrets/dev.env.enc` from the repo sees the
+  key names but never the values without a matching age secret key.
+- Rotating one recipient does not re-encrypt existing files — `sops`
+  needs an explicit `sops updatekeys` invocation. `envless` does not
+  expose this yet; see [Rotation](#key-rotation--compromise-response).
+- The data key is symmetric (AES-256) — there is no asymmetric
+  per-value encryption. Cracking one value worth of ciphertext does
+  not extend to others, but compromising the data key compromises the
+  entire file. The data key is itself wrapped to each recipient's age
+  pubkey via X25519 + ChaCha20-Poly1305.
+
+### Audited and battle-tested
+
+- **age** has had at least [two formal audits][age-audits] (Cure53,
+  Trail of Bits) and is built by Filippo Valsorda, ex-Go cryptography
+  lead.
+- **sops** is an OWASP-sponsored project, used in production by
+  Mozilla, Adobe, and others, with [security advisories][sops-sec]
+  published openly.
+
+`envless` adds zero new crypto code on top. Its security posture is
+"the union of age and sops at their currently pinned versions."
+
+## Key rotation & compromise response
+
+There are two kinds of rotation in `envless`, and conflating them is
+the most common mistake.
+
+1. **Rotating an identity** — replacing an age keypair, e.g. when a
+   developer leaves or a laptop is lost.
+2. **Rotating a secret value** — replacing the credential itself
+   (`OPENAI_API_KEY=sk-old → sk-new`), e.g. when a key leaks.
+
+Each requires a different response.
+
+### Identity rotation (someone leaves the project)
+
+When a recipient must lose access:
+
+```bash
+# 1. Edit .envless/recipients — remove the departed pubkey.
+$EDITOR .envless/recipients
+
+# 2. Re-encrypt every env. v0.0.1 has no `envless re-encrypt`; the
+#    portable approach is decrypt → write → push:
+for env in dev prod; do
+  for key in $(envless list --env="$env"); do
+    val=$(envless get "$key" --env="$env" --confirm)
+    printf '%s' "$val" | envless set "$key" --env="$env"
+  done
+done
+
+# 3. Commit and push.
+git add .envless/recipients secrets/
+git commit -m "revoke departed recipient; re-encrypt envs"
+git push
+```
+
+Important caveat: the removed recipient had access to the *current
+secret values* up to the moment of revocation. They retain that
+knowledge. Identity rotation does **not** protect against secrets they
+have already observed.
+
+If the recipient was hostile or compromised, treat every secret they
+could read as compromised and follow *secret rotation* below.
+
+### Secret rotation (a credential leaked)
+
+When a value itself is compromised:
+
+```bash
+# 1. Rotate at the upstream provider (Stripe dashboard, OpenAI
+#    console, etc.). Get the new value.
+NEW="sk-newvalue-xyz"
+
+# 2. Replace in envless.
+printf '%s' "$NEW" | envless set OPENAI_API_KEY --env=prod
+
+# 3. Commit and deploy.
+git add secrets/prod.env.enc
+git commit -m "rotate OPENAI_API_KEY (provider rotation)"
+git push
+```
+
+Provider rotation is the source of truth; `envless set` is the
+mirror. Future versions (v0.2) will add `envless rotate KEY` adapters
+that call the provider API for you.
+
+### Identity loss (laptop stolen, key file leaked)
+
+This is the worst case: the secret key itself has escaped your
+control. Do, in order:
+
+1. **Treat every secret encrypted to that pubkey as compromised.**
+   Anyone with the secret key can decrypt all current and prior
+   encrypted files in Git history.
+2. **Rotate every credential at the upstream provider.**
+3. **Generate a new identity** (`envless init` after `rm
+   .envless/identity.key`).
+4. **Edit `.envless/recipients`** to replace the old pubkey with the
+   new one.
+5. **Re-encrypt every env** as above.
+6. **Force-push history rewrites only if you must** — Git history
+   contains the encrypted files. They are unreadable without the lost
+   key, but a defense-in-depth rewrite is fine.
+
+### What v0.0.1 does not have yet
+
+- `envless panic` — single command for the steps above. Coming in v0.2.
+- `envless rotate KEY` — provider-aware rotation. v0.2.
+- `envless team revoke USER` — recipient management via CLI. v0.1.
+
+Until then, the manual sequences above are the supported workflow.
+
+## Audit & supply chain
+
+`envless` is a small Go binary built from a small dependency graph.
+The audit surface is intentionally narrow.
+
+### Direct dependencies
+
+From `go.mod` ([source][gh-gomod]):
+
+| Module | Version | Why |
+|---|---|---|
+| `github.com/spf13/cobra` | v1.10.2 | CLI subcommand wiring |
+| `github.com/spf13/pflag` | v1.0.9 | flag parsing (cobra transitive) |
+| `github.com/inconshreveable/mousetrap` | v1.1.0 | Windows entry-point shim (cobra transitive) |
+
+That is the entire transitive set. No HTTP clients, no JSON schemas,
+no YAML libraries, no SDKs. A `go mod graph` should print three
+lines.
+
+### External binaries envless shells out to
+
+`envless` is useless without these on `PATH`. They are not bundled.
+
+- **`age-keygen`** — from [filippo.io/age][age-gh]. BSD-3-Clause.
+- **`sops`** — from [getsops/sops][sops-gh]. MPL-2.0.
+
+The shell-out commands are exactly:
+
+- `age-keygen -o <path>`
+- `sops encrypt --input-type dotenv --output-type dotenv --age <recipients> <file>`
+- `sops decrypt --input-type dotenv --output-type dotenv <file>` (with `SOPS_AGE_KEY_FILE`)
+
+No other binary is invoked. No network calls.
+
+### Network behaviour
+
+`envless` makes zero outbound network calls in v0.0.1. Confirm with:
+
+```bash
+strace -f -e trace=network envless exec -- true
+# (no connect, no sendto)
+```
+
+If that ever changes, it will be documented and gated behind an
+explicit flag.
+
+### Build provenance
+
+The release pipeline ([`.github/workflows/release.yml`][gh-release])
+uses [goreleaser] to cross-compile static binaries on
+`ubuntu-latest` GitHub-hosted runners. The build:
+
+- Disables CGO (`CGO_ENABLED=0`) — pure-Go static binary.
+- Uses `-trimpath` and `-ldflags "-s -w"` — reproducible-ish output,
+  no debug symbols, no local paths leaking into the binary.
+- Targets `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`.
+
+The release tag is the only input. To reproduce a release locally:
+
+```bash
+git checkout v0.0.1
+goreleaser release --snapshot --clean
+sha256sum dist/envless_*.tar.gz
+```
+
+### Verifying a downloaded binary
+
+GoReleaser emits `checksums.txt` next to each release. Verify:
+
+```bash
+curl -LO https://github.com/biliboss/envless/releases/download/v0.0.1/envless_0.0.1_linux_amd64.tar.gz
+curl -LO https://github.com/biliboss/envless/releases/download/v0.0.1/checksums.txt
+sha256sum -c --ignore-missing checksums.txt
+```
+
+Signed binaries (cosign) are a v1.0 goal — see the
+[roadmap](/envless/why/#roadmap).
+
+### Vulnerability response
+
+Report security issues by email rather than a public issue. See the
+GitHub repo's `SECURITY.md` (will be added before v0.1). For now, file
+a [private security advisory][gh-advisory].
+
+### What you should still audit yourself
+
+- The pinned versions of `age` and `sops` on your developer machines.
+  They are not part of the envless release artifact.
+- The `.envless/recipients` file in your repo — `git log -p
+  .envless/recipients` shows every access change.
+- The build provenance of `envless` itself if you build from source.
+  `go mod verify` confirms the dependency hashes match `go.sum`.
+
+[age]: https://age-encryption.org/v1
+[sops]: https://getsops.io/docs/
+[age-spec]: https://age-encryption.org/v1
+[sops-docs]: https://getsops.io/docs/
+[age-audits]: https://github.com/FiloSottile/age#security
+[sops-sec]: https://github.com/getsops/sops/security
+[gh-store]: https://github.com/biliboss/envless/blob/main/internal/store/store.go
+[gh-sopswrap]: https://github.com/biliboss/envless/blob/main/internal/sopswrap/sopswrap.go
+[gh-gomod]: https://github.com/biliboss/envless/blob/main/go.mod
+[gh-release]: https://github.com/biliboss/envless/blob/main/.github/workflows/release.yml
+[gh-advisory]: https://github.com/biliboss/envless/security/advisories
+[age-gh]: https://github.com/FiloSottile/age
+[sops-gh]: https://github.com/getsops/sops
+[goreleaser]: https://goreleaser.com/

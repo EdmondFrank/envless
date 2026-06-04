@@ -1,0 +1,296 @@
+---
+title: Why envless
+description: Positioning, the side-by-side comparison vs Vault / 1Password / Infisical / dotenv-vault, explicit non-goals, license & governance, and the roadmap from v0.0.1 to v1.
+---
+
+`envless` is an open-source CLI that replaces plaintext `.env` files
+with encrypted-in-repo secrets, while preserving the `process.env.KEY`
+interface that every language and framework already speaks.
+
+It is built for the era where every developer drives multiple AI
+agents, schedules background jobs, and shares logs in transcripts
+that were never meant to hold credentials. The assumptions that made
+`.env` workable for a single human at a single laptop have stopped
+holding.
+
+## Positioning
+
+### What envless is
+
+- A single static binary on top of two well-audited primitives:
+  [age] for encryption and [sops] for per-value secret operations.
+- File-based and Git-native. Encrypted files live next to your code;
+  access control is a public-key list that diffs cleanly in a pull
+  request.
+- Zero servers, zero accounts, zero SaaS. There is nothing to log
+  into, no tier to upgrade, no vendor to depend on.
+- Language-agnostic. `envless exec -- your-command` injects secrets
+  into the child process's environment at fork time. Your application
+  keeps reading `process.env.X`.
+
+### Who it is for
+
+- **Solo developers** who want secrets out of `.env` without standing
+  up a KMS.
+- **Small teams** that need granular, revocable access without buying
+  a vault service.
+- **Agent-driven workflows** where multiple autonomous processes need
+  scoped credentials and where shared `.env` files are an audit
+  nightmare.
+- **CI/CD pipelines** that today copy-paste `.env` contents into
+  provider secret stores and watch them drift.
+
+### What envless is not
+
+`envless` is not a hosted vault, not a password manager, not a KMS
+replacement for cloud-native deployments. See
+[When NOT to use envless](#when-not-to-use) below for the explicit
+non-goals.
+
+## Comparison
+
+There is no shortage of secret managers. Here is how `envless` sits
+next to the most common alternatives. The goal is not to win every
+column — it is to make the trade-offs explicit so you pick the right
+tool.
+
+| Dimension | envless | HashiCorp Vault | 1Password CLI | Infisical | dotenv-vault |
+|---|---|---|---|---|---|
+| **Hosting** | none (file in repo) | self-hosted server | hosted | hosted or self | hosted |
+| **Account required** | no | no | yes | yes | yes |
+| **Cost** | free, OSS | free OSS / paid HCP | paid | freemium | freemium |
+| **Encryption at rest** | age + sops | own KMS | proprietary | own KMS | proprietary |
+| **Access control** | age recipients (per pubkey) | policies + tokens | vaults + groups | projects + roles | env-level |
+| **Revocation** | remove pubkey + re-encrypt | revoke token | remove user | remove member | rotate token |
+| **Audit trail** | git history of `recipients` | server logs | hosted logs | hosted logs | hosted logs |
+| **Process injection** | `envless exec -- cmd` | sidecar / templates | `op run --env-file` | `infisical run` | `dotenv-vault run` |
+| **Works offline** | yes | no (needs server) | partial | no | no |
+| **CI/CD model** | bot keypair = recipient | token in CI | service account | service token | service token |
+| **License** | Apache-2.0 | BSL 1.1 / MPL | proprietary | MIT + commercial | proprietary |
+| **Lock-in risk** | none (files + age key) | medium (Vault paths) | high (account) | medium | high |
+
+### When each makes sense
+
+- **HashiCorp Vault** — large org, central security team, dynamic
+  secrets, cross-cloud. You need policies, leases, audit devices.
+  Don't pick `envless` against Vault for a regulated bank.
+- **1Password CLI** — your team already lives in 1Password.
+  Integrating `op` is friction-free for them. Lock-in is the price.
+- **Infisical** — you want a hosted dashboard with project/role UI
+  and webhook integrations. `envless` does not provide a dashboard.
+- **dotenv-vault** — closest in spirit. Hosted, multi-env, simple
+  CLI. Choose it if you want zero file-management and accept the
+  hosted account.
+- **envless** — you want the simplest possible substrate: encrypted
+  files in your repo, age public keys as the access list, no server.
+  You are comfortable with the file living in Git.
+
+### What envless deliberately does not have
+
+- A web dashboard.
+- A free vs. paid tier.
+- A hosted account or login flow.
+- Provider integrations (AWS Secrets Manager, GCP Secret Manager) —
+  those belong at deploy time, not in your developer loop.
+
+## When NOT to use
+
+`envless` is small on purpose. The cost of staying small is that it
+does not fit every secret-management need. Here are the situations
+where you should pick something else.
+
+### Pick a real KMS when
+
+- You deploy to a single cloud and the workload runs under an IAM
+  role. Cloud-native KMS (AWS Secrets Manager, GCP Secret Manager,
+  Azure Key Vault) ties secrets to identity at the platform layer.
+  Bypassing that to ship encrypted files in a repo is a regression.
+- You need dynamic credentials with leases — short-lived database
+  passwords, ephemeral cloud tokens. `envless` is static-secret only.
+- You have an active red team and need pre-deploy secret rotation
+  with attested supply-chain integrity. Vault + a notary tool is the
+  expected stack.
+
+### Pick a hosted vault when
+
+- You want a UI for non-engineers to manage keys.
+- You need SSO/SAML integration for human access.
+- You need a compliance-grade audit log (SOC 2, ISO 27001) wired
+  into a SIEM.
+
+### Pick a password manager when
+
+- The credentials are human-only: server SSH passphrases, account
+  recovery codes, personal API tokens you do not want any agent or
+  process to read.
+- You need to share with non-developers who will never check out the
+  repo.
+
+### Pick `gh secrets set` / provider-native secrets when
+
+- The secret is exclusive to one CI provider and never touches
+  developer machines. GitHub Actions secrets, Vercel env vars, etc.
+  are encrypted at rest by the provider and can be limited to
+  deploy contexts.
+
+### Hard limits of envless v0.0.1
+
+These are not philosophical — they are current implementation gaps.
+Track the [roadmap](#roadmap) below for status.
+
+- **Single identity per repo.** Multi-recipient is the file format
+  (`.envless/recipients` accepts many lines), but the v0.0.1 `init`
+  command writes only the local pubkey. You manage extra recipients
+  by editing the file by hand.
+- **No `panic` mode.** No one-command revoke-and-re-encrypt across
+  all envs. Coming in v0.2.
+- **No GUI.** There will never be a GUI.
+- **No remote sync.** Sync is `git push`. If your team cannot use
+  Git, `envless` is the wrong tool.
+
+### Co-existing with envless
+
+`envless` is happy to share a project with:
+
+- **direnv** for shell-level env loading. `envless exec` is for
+  spawning; `direnv` is for interactive shells.
+- **gh secrets / Vercel env** as deploy-time stores. Use a CI step
+  that decrypts and re-exports.
+- **A KMS for prod.** `envless` for dev/staging, KMS for prod.
+  Different trust boundaries, different tools.
+
+## License & governance
+
+`envless` is licensed under the [Apache License, Version 2.0][apache],
+a permissive open-source license that the OSI, FSF, and most
+corporate legal teams already accept without review.
+
+### What Apache-2.0 grants you
+
+- **Use** — commercial or otherwise, with no royalty.
+- **Modify** — fork, patch, vendor. No callback obligation.
+- **Distribute** — ship the binary in your product, embed it in a
+  Docker image, redistribute under a different name. Keep the
+  NOTICE.
+- **Patent grant** — explicit patent license from contributors.
+  Vault's BSL does not give you this.
+
+### What it asks of you
+
+- Keep the copyright notice and the LICENSE file with any
+  redistribution.
+- Mark significant changes if you redistribute a modified version.
+- No warranty. Treat it like every other OSS dependency.
+
+The full text lives in [LICENSE][gh-license] at the repo root, dated
+2026 and copyrighted to Gabriel Fonseca.
+
+### Governance
+
+`envless` is, today, a single-maintainer project. There is no
+foundation, no steering committee, and no Contributor License
+Agreement. The contribution model is:
+
+1. Open a GitHub issue describing the change.
+2. Send a pull request. The Apache-2.0 implied-license clause (§5)
+   covers contributions; you do not sign a separate CLA.
+3. Reviews focus on parity with the architectural principles in
+   [Positioning](#positioning) — no SaaS coupling, no language SDKs,
+   no spinners.
+
+If `envless` grows beyond a single maintainer, governance will be
+formalised before that becomes a problem (likely a small TSC and a
+trademark policy). It will not be retroactively re-licensed.
+
+### Relicensing posture
+
+The license will stay permissive. `envless` will not adopt:
+
+- BSL or SSPL — they break the "use commercially without
+  negotiation" promise.
+- AGPL — overkill for a CLI; chills downstream embedding.
+- Source-available-then-commercial — that is a SaaS funnel, not OSS.
+
+If those terms matter to your procurement team, the answer is the
+same today as it will be in five years: Apache-2.0.
+
+### Dependencies and their licenses
+
+`envless` is intentionally low-dependency. Run `go mod graph` (or
+read [`go.mod`][gh-gomod]) for the current set. The substrate it
+shells out to:
+
+- **age** — BSD-3-Clause.
+- **sops** — MPL-2.0.
+
+Both are compatible with Apache-2.0 redistribution.
+
+## Roadmap
+
+`envless` follows a deliberate "smallest useful thing first" release
+cadence. The v0.0.1 line is single-developer ergonomics. The v0.1
+line opens to teams. The v0.2 line hardens the security operations
+surface. v1 is the API-stable cutover.
+
+### Shipped — v0.0.1
+
+The single-user core is complete and tested end-to-end.
+
+- `envless init` — local age identity + recipients file
+- `envless set / get / list` — encrypted KV operations
+- `envless exec` — process injection, the star command
+- `envless migrate` — one-shot `.env` → encrypted migration
+- Apache-2.0, GitHub Pages docs, GitHub Actions CI
+
+See [CLI reference](/envless/cli/) for the full surface.
+
+### Next — v0.1 (Teams)
+
+- **`@envless/skill`** — `npx @envless/skill install` installs
+  envless, configures the local repo, and registers a Claude Code /
+  Cursor skill.
+- **Per-env recipients** — `.envless/team.yaml` enumerates members
+  and scopes. `envless set` and `envless write` re-encrypt to the
+  current recipient list per env.
+- **Plugins** — subprocess binaries `envless-<kind>-<name>`. Initial
+  plugins: `detect-node` (autodetects `process.env` keys),
+  `ci-github` (patches workflows to inject from envless).
+- **`envless team add / remove`** — recipient management via CLI.
+
+### After that — v0.2 (Operations)
+
+- **`envless panic`** — one command rotates the identity, re-encrypts
+  every env, and emits a recipients-changed manifest.
+- **Rotation adapters** — OpenAI, Stripe, Anthropic, etc. `envless
+  rotate KEY` invokes the adapter, replaces the secret in-place.
+- **Inbox / notice** — asynchronous secret hand-off between team
+  members without out-of-band channels.
+
+### v1 — API stable
+
+- File-format freeze: any v0.x encrypted file decrypts under v1.
+- CLI flag/exit-code freeze.
+- Docs blog launch.
+- Signed releases (cosign).
+
+### What is explicitly off the roadmap
+
+- A hosted dashboard.
+- Provider-fetch (Vault, AWS Secrets Manager) — that is `teller`'s
+  job.
+- A language SDK. `process.env.X` is the SDK.
+- A free vs. paid tier.
+
+### Read the open issues
+
+The roadmap above is the editorial summary. The truth lives in
+GitHub.
+
+- [Open issues](https://github.com/biliboss/envless/issues)
+- [Milestones](https://github.com/biliboss/envless/milestones)
+
+[age]: https://age-encryption.org/v1
+[sops]: https://getsops.io/docs/
+[apache]: https://www.apache.org/licenses/LICENSE-2.0
+[gh-license]: https://github.com/biliboss/envless/blob/main/LICENSE
+[gh-gomod]: https://github.com/biliboss/envless/blob/main/go.mod
