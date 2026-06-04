@@ -21,6 +21,10 @@
 
 const std = @import("std");
 
+// Cross-target libc decl. `std.posix.getuid` is not exposed for the macOS
+// cross-compile in Zig 0.13's stdlib slice, so we bind libc directly.
+extern fn getuid() callconv(.C) std.posix.uid_t;
+
 pub const DEFAULT_LABEL = "io.github.biliboss.envless";
 pub const LABEL_ENV = "ENVLESS_LAUNCHD_LABEL";
 
@@ -47,7 +51,7 @@ fn computePaths(a: std.mem.Allocator, home: []const u8, label: []const u8) !Path
     const cache_dir = try std.fmt.allocPrint(a, "{s}/.cache/envless", .{home});
     const stdout_log = try std.fmt.allocPrint(a, "{s}/daemon.out.log", .{cache_dir});
     const stderr_log = try std.fmt.allocPrint(a, "{s}/daemon.err.log", .{cache_dir});
-    const uid = std.c.getuid();
+    const uid = getuid();
     return .{
         .label = label,
         .plist_dir = plist_dir,

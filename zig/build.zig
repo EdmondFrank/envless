@@ -187,7 +187,8 @@ pub fn build(b: *std.Build) void {
     script.appendSlice("cd ../dist && : > checksums.txt && ") catch @panic("OOM");
     for (tar_names.items, 0..) |name, i| {
         if (i != 0) script.appendSlice(" && ") catch @panic("OOM");
-        script.writer().print("shasum -a 256 '{s}' | awk '{{print $1\"  \"\"{s}\"}}' >> checksums.txt", .{ name, name }) catch @panic("OOM");
+        // Prefer sha256sum (Linux coreutils); fall back to shasum (macOS / Perl).
+        script.writer().print("{{ sha256sum '{s}' 2>/dev/null || shasum -a 256 '{s}'; }} | awk '{{print $1\"  \"\"{s}\"}}' >> checksums.txt", .{ name, name, name }) catch @panic("OOM");
     }
     checksum_cmd.addArg(script.items);
     for (tar_steps.items) |s| checksum_cmd.step.dependOn(s);

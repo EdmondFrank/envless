@@ -13,6 +13,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// Cross-target libc decl. `std.posix.getuid` is not exposed for the macOS
+// cross-compile in Zig 0.13's stdlib slice, so we bind libc directly.
+extern fn getuid() callconv(.C) std.posix.uid_t;
+
 const root = @import("root.zig");
 const daemon = @import("../daemon.zig");
 const ipc = @import("../ipc.zig");
@@ -174,7 +178,7 @@ fn runStop(ctx: *root.Context) !u8 {
             const label_env = std.process.getEnvVarOwned(ctx.allocator, launchd.LABEL_ENV) catch null;
             defer if (label_env) |l| ctx.allocator.free(l);
             const label = if (label_env) |l| l else launchd.DEFAULT_LABEL;
-            const uid = std.c.getuid();
+            const uid = getuid();
             const target = try std.fmt.allocPrint(ctx.allocator, "gui/{d}/{s}", .{ uid, label });
             defer ctx.allocator.free(target);
             const argv = [_][]const u8{ "/bin/launchctl", "kill", "TERM", target };
