@@ -46,7 +46,13 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/checksums.txt
-          draft: true
+          # Published (not draft) so the tarball URLs the Homebrew
+          # formula references resolve immediately. Pre-releases use
+          # the `prerelease: true` semantics via tag naming
+          # (`-rc`, `-beta` etc).
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
