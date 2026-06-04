@@ -16,26 +16,26 @@
 class Envless < Formula
   desc "Agent-first secrets manager — encrypted dotenv files in git via sops+age"
   homepage "https://biliboss.github.io/envless/"
-  version "0.1.0"
+  version "0.2.0"
   license "Apache-2.0"
 
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/biliboss/envless/releases/download/v#{version}/envless_v#{version}_aarch64-macos.tar.gz"
-      sha256 "b760bd16919fab684666fe7b7bda8bb5ce2f801c81b25c251a5a67d18b4b2614"
+      sha256 "4d39055e7d868e54e72ae85b5be80b717780375661bf7c2cce705985492962b0"
     else
       url "https://github.com/biliboss/envless/releases/download/v#{version}/envless_v#{version}_x86_64-macos.tar.gz"
-      sha256 "7820451d0c788f3a13a89bee5571ecce92b30494f549df0d229acb5bdac0d585"
+      sha256 "acc941323d183bcc6fa1666f313d17e375e9699c012149c1444c2d439fef6d9c"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
       url "https://github.com/biliboss/envless/releases/download/v#{version}/envless_v#{version}_aarch64-linux-gnu.tar.gz"
-      sha256 "17d3371791a6a04833fd4b5d3d81773be01b6209ed7c0894be88598b0ffa9067"
+      sha256 "1934ee218238b15584da9c919b6270ff18aaa59fcd96a83ed74683e51a1cd0f9"
     else
       url "https://github.com/biliboss/envless/releases/download/v#{version}/envless_v#{version}_x86_64-linux-gnu.tar.gz"
-      sha256 "447436d9143d0bde783714f9046d0f89bde82f02df2d84b75ea565b160bc480c"
+      sha256 "10a5685ca41f51dcf9fff961bf4eab2b36329f70c29027775d6991962d436f4e"
     end
   end
 
