@@ -21,6 +21,13 @@ pub fn run(ctx: *root.Context, args: []const []const u8) !u8 {
     const exec_flags = if (sep_idx) |i| args[0..i] else args[0..];
     const child_argv: []const []const u8 = if (sep_idx) |i| args[i + 1 ..] else empty_args;
 
+    // -h/--help on exec only counts if it appears before `--` (after which
+    // it's part of the child argv and should pass through untouched).
+    if (root.wantsHelp(exec_flags)) {
+        try printHelp(ctx);
+        return 0;
+    }
+
     var rest = std.ArrayList([]const u8).init(ctx.allocator);
     defer rest.deinit();
     const env_opt = try root.popStringFlag(exec_flags, "--env", &rest);
@@ -28,11 +35,13 @@ pub fn run(ctx: *root.Context, args: []const []const u8) !u8 {
 
     if (rest.items.len != 0) {
         try ctx.stderr.writer().writeAll("envless: exec: unexpected positional args before --\n");
-        return 1;
+        try ctx.stderr.writer().writeAll("Run `envless exec -h` for help.\n");
+        return 2;
     }
     if (child_argv.len == 0) {
         try ctx.stderr.writer().writeAll("envless: exec: missing command\n");
-        return 1;
+        try ctx.stderr.writer().writeAll("Run `envless exec -h` for help.\n");
+        return 2;
     }
 
     const s = store.Store.init(ctx.allocator, ctx.cwd);
@@ -88,4 +97,50 @@ pub fn run(ctx: *root.Context, args: []const []const u8) !u8 {
         .success => 0,
         .non_zero => |code| code,
     };
+}
+
+fn printHelp(ctx: *root.Context) !void {
+    const w = ctx.stdout.writer();
+    const s = root.Style.fromFile(ctx.stdout);
+    const b = s.bold();
+    const d = s.dim();
+    const r = s.reset();
+
+    try w.print("envless exec {s}— run a command with secrets injected{s}\n\n", .{ d, r });
+
+    try w.print("{s}Usage:{s}\n", .{ b, r });
+    try w.writeAll("  envless exec [--env=NAME] -- CMD [ARGS...]\n\n");
+
+    try w.print("{s}Description:{s}\n", .{ b, r });
+    try w.writeAll("  Decrypts secrets/<env>.env.enc, merges into the parent's environment\n");
+    try w.writeAll("  (overriding any matching parent keys), then execs CMD with that env.\n");
+    try w.writeAll("  Secrets are passed to the child via the env array — never via argv,\n");
+    try w.writeAll("  never via stdout. The child inherits stdin/stdout/stderr; its exit\n");
+    try w.writeAll("  code is propagated as envless's exit code.\n\n");
+
+    try w.print("{s}Flags:{s}\n", .{ b, r });
+    try w.writeAll("  --env=NAME      environment to load (default: dev)\n");
+    try w.writeAll("  -h, --help      show this help (only if it appears before `--`)\n\n");
+
+    try w.print("{s}Examples:{s}\n", .{ b, r });
+    try w.print("  {s}# Run a Node app with secrets injected{s}\n", .{ d, r });
+    try w.writeAll("  envless exec --env=dev -- node server.js\n\n");
+    try w.print("  {s}# One-off curl with secrets in the env{s}\n", .{ d, r });
+    try w.writeAll("  envless exec --env=prod -- sh -c 'curl -H \"Authorization: Bearer $TOKEN\" https://api'\n\n");
+    try w.print("  {s}# Pass extra env to the child by setting it before the call{s}\n", .{ d, r });
+    try w.writeAll("  CUSTOM_FLAG=1 envless exec --env=dev -- ./script.sh\n\n");
+
+    try w.print("{s}Exit codes:{s}\n", .{ b, r });
+    try w.writeAll("  0    child process exited 0\n");
+    try w.writeAll("  N    child process exited N (propagated)\n");
+    try w.writeAll("  2    usage error (missing `--`, no command)\n");
+    try w.writeAll("  64   no .envless/ found\n");
+    try w.writeAll("  65   corrupt sops file\n");
+    try w.writeAll("  66   env not found\n");
+    try w.writeAll("  74   exec failure (binary not on PATH, permission denied)\n\n");
+
+    try w.print("{s}See also:{s}\n", .{ b, r });
+    try w.writeAll("  envless list      list keys without exposing values\n");
+    try w.writeAll("  envless get       print one secret value\n");
+    try w.writeAll("  Docs:             https://biliboss.github.io/envless/cli/#envless-exec-env-env-cmd-args\n");
 }
