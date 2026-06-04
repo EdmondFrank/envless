@@ -114,8 +114,9 @@ bench/compare.sh <baseline-sha> <candidate-sha>
 - **Hyperfine warmup count is intentionally small**. 3 warmups + 10/30/50
   runs keeps the harness under a minute per toolchain on a 2024-class
   laptop. If you bump it, also bump the CI workflow timeout.
-- **E2E wall-clock includes `go test` startup**. We measure the whole suite
-  end-to-end on purpose — that is what a contributor actually waits for.
+- **E2E wall-clock includes `zig build e2e` from a cold cache**. We
+  measure the whole suite end-to-end on purpose — that is what a
+  contributor actually waits for.
 
 ## CI
 

@@ -120,8 +120,9 @@ stderr.
 |---|---|---|
 | `--env` | `dev` | Target environment. |
 
-The `--` separator is conventional but not strictly required by
-cobra; include it to avoid ambiguity with envless's own flags.
+The `--` separator is conventional but not strictly required by the
+envless dispatcher; include it to avoid ambiguity with envless's own
+flags.
 
 Exit code: child's exit code on a clean run. See
 [Exit codes](#exit-codes) below for failure modes.
@@ -260,11 +261,11 @@ into `exec` children.
 
 | Variable | Read by | Purpose |
 |---|---|---|
-| `PATH` | OS / `os/exec` | Locating `age-keygen` and `sops`. Standard `exec.LookPath` semantics. |
+| `PATH` | OS / `std.process.Child` | Locating `age-keygen` and `sops`. Standard PATH-search semantics. |
 
-That is the entire intentional read set in v0.0.1. Anything else
-cobra or the Go runtime touches (`HOME`, `TMPDIR`) is incidental and
-not part of the contract.
+That is the entire intentional read set in v0.0.1. Anything else the
+Zig stdlib touches (`HOME`, `TMPDIR`) is incidental and not part of
+the contract.
 
 ### Set by envless (for child processes)
 
