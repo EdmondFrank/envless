@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "envless": {
+      "type": "stdio",
+      "command": "envless",
+      "args": [
+        "mcp"
+      ],
+      "env": {}
+    }
+  }
+}
