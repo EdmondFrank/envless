@@ -2,6 +2,7 @@ bin/
 dist/
 .astro/
 .claude/
+.docker-build/
 coverage.out
 *.test
 *.prof

@@ -76,4 +76,28 @@ pub fn build(b: *std.Build) void {
         const run_t = b.addRunArtifact(t);
         test_step.dependOn(&run_t.step);
     }
+
+    // ---- e2e tests ----
+    // The e2e suite shells out to the installed envless binary. It depends
+    // on `b.getInstallStep()` so `zig build e2e` always builds the binary
+    // first and points the harness at zig-out/bin/envless via the BIN env
+    // var (absolute path; the test runner's cwd is the zig-cache, not the
+    // project root, so a relative fallback wouldn't resolve).
+    if (have_main) {
+        const e2e_step = b.step("e2e", "Run end-to-end tests against the built binary");
+        const e2e_t = b.addTest(.{
+            .root_source_file = b.path("src/e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        e2e_t.linkLibC();
+        const run_e2e = b.addRunArtifact(e2e_t);
+        run_e2e.step.dependOn(b.getInstallStep());
+        // Compute an absolute path to zig-out/bin/envless via the install
+        // prefix so the harness can spawn it regardless of cwd.
+        const bin_path = b.getInstallPath(.bin, "envless");
+        run_e2e.setEnvironmentVariable("BIN", bin_path);
+        e2e_step.dependOn(&run_e2e.step);
+    }
+
 }
