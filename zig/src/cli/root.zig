@@ -12,6 +12,8 @@ const get_cmd = @import("get.zig");
 const list_cmd = @import("list.zig");
 const exec_cmd = @import("exec.zig");
 const migrate_cmd = @import("migrate.zig");
+const mcp_cmd = @import("mcp.zig");
+const daemon_cmd = @import("daemon.zig");
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -65,6 +67,8 @@ pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, version: []co
     if (std.mem.eql(u8, sub, "list")) return list_cmd.run(&ctx, rest);
     if (std.mem.eql(u8, sub, "exec")) return exec_cmd.run(&ctx, rest);
     if (std.mem.eql(u8, sub, "migrate")) return migrate_cmd.run(&ctx, rest);
+    if (std.mem.eql(u8, sub, "mcp")) return mcp_cmd.run(&ctx, rest);
+    if (std.mem.eql(u8, sub, "daemon")) return daemon_cmd.run(&ctx, rest);
 
     try ctx.stderr.writer().print("envless: unknown command: {s}\n", .{sub});
     return 1;
@@ -84,6 +88,8 @@ fn printUsage(ctx: *Context) !void {
         \\  list       list keys in an env (does not print values)
         \\  exec       run a command with secrets injected as env vars
         \\  migrate    encrypt a .env file into envless and gitignore the plaintext
+        \\  mcp        run MCP server (JSON-RPC 2.0 over stdio)
+        \\  daemon     run/install/uninstall/status the optional decrypt-cache daemon
         \\
         \\Flags:
         \\  -h, --help       help
