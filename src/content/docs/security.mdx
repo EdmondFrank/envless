@@ -1,27 +1,71 @@
 ---
 title: Security
-description: What envless protects against (and doesn't), the concrete crypto primitives it uses, how to rotate keys after a leak, and how to audit the supply chain.
+description: Threat model, cryptographic primitives, rotation playbook, operational hardening, and supply-chain surface — what envless protects against, what it doesn't, and when to graduate to a KMS.
 ---
 
 `envless` inherits its cryptographic guarantees from [age] and [sops].
 It is a thin orchestrator; it adds no new primitives, but it also adds
 no new attack surface beyond the shell-out to those binaries. This
-page walks the threat model, the concrete crypto, the rotation
-playbook, and the supply-chain surface — in that order.
+page walks **assumptions → threat model → crypto → rotation →
+operational hardening → integration patterns → supply chain**, in that
+order.
+
+## Assumptions
+
+Read these before the rest. `envless` is correct *only* under these
+preconditions. If any are false for your environment, you need a
+different tool (most likely a cloud KMS).
+
+- **Developer machines are reasonably trusted.** Not compromised by
+  malware, not multi-tenant, no untrusted users on the same login.
+- **Recipients are not actively hostile.** Adding someone to
+  `.envless/recipients` is a one-way trust grant. There is no time-
+  scoped credential, no "read-only" tier, no per-key ACL.
+- **Git history is not adversary-accessible at rest.** The encrypted
+  files are safe in public repos, but you should not assume an
+  attacker who clones your repo has *less* power than one who reads
+  `.envless/identity.key` directly.
+- **`sops` and `age` binaries on `PATH` are uncompromised.** `envless`
+  does not verify their signatures (yet — see roadmap).
+- **You have an out-of-band way to enrol new recipients.** Adding a
+  pubkey to `recipients` itself goes through your normal code-review
+  channel (a PR). `envless` does not bootstrap trust.
+- **No regulatory regime requires hardware-backed key custody.** PCI,
+  HIPAA, SOC 2 with mandated HSM, FedRAMP — none of these are
+  in-scope. See [When NOT to use](#when-not-to-use-envless) below.
+
+If even one of these is false for your case, stop here and use AWS
+KMS / GCP KMS / HashiCorp Vault.
 
 ## Threat model
+
+### Adversary tiers
+
+`envless` is opinionated about *which* adversary it covers. Be
+explicit with yourself about which row you're really worried about.
+
+| Tier | Examples | Covered by envless? |
+|---|---|---|
+| **Casual** | shoulder-surfer, `console.log(process.env)` in shared chat, accidental `git push` of `.env` | **Yes** — by design. |
+| **Opportunistic** | stolen laptop, public-repo crawler, agent transcript leaked | **Partial** — repo content stays opaque; the lost laptop's `identity.key` is a full compromise unless the disk is FDE'd. |
+| **Insider** | departed teammate, hostile recipient | **Limited** — revocation stops future reads, not past ones; you must rotate values, not just recipients. |
+| **Targeted / APT** | nation-state, ptrace on running process, supply-chain backdoor in `sops` | **No** — out of scope. Use a cloud KMS with workload identity and HSM-backed keys. |
+
+The product target is the first two tiers, with explicit playbooks
+for the third. The fourth is a category error for any disk-resident
+secrets manager.
 
 ### What envless protects against
 
 - **Secret leakage in commits.** Plaintext `.env` files are gone.
-  Every committed file (`secrets/*.env.enc`, `.envless/recipients`) is
-  either encrypted or a public-key list.
+  Every committed file (`secrets/*.env.enc`, `.envless/recipients`)
+  is either encrypted or a public-key list.
 - **Casual shoulder-surfing.** `envless list` prints keys but never
   values. `envless get` requires `--confirm`. `envless exec` writes
   secrets only into the child process's env array — never stdout.
-- **Lost laptop, no `identity.key`.** Without the age secret key,
-  encrypted files in the repo are bytes of ciphertext. Recipients can
-  be added/removed, identities revoked by re-encrypting.
+- **Lost laptop with FDE on, no `identity.key` extractable.** Without
+  the age secret key, encrypted files in the repo are bytes of
+  ciphertext.
 - **Drift between developer machines.** The encrypted file in Git is
   the canonical source. There is no "what's in your local `.env`?"
   divergence.
@@ -31,36 +75,32 @@ playbook, and the supply-chain surface — in that order.
 
 ### What envless does NOT protect against
 
-These are the parts where treating `envless` as a vault would be a
-category error.
-
 - **A running process inspected via `ptrace`, `/proc/<pid>/environ`,
   or memory dump.** Once a secret is loaded into the child's env, the
-  child's memory is fair game. Use a real cloud KMS with workload
-  identity if this is your threat.
+  child's memory is fair game.
 - **A malicious recipient.** Adding a pubkey to `.envless/recipients`
   grants permanent access to every encrypted file from that point on.
   Revoking the pubkey only stops *future* encryptions from being
   readable. Anyone who held the key during the window can decrypt
-  history. Rotate secret values, not just recipients. See
+  history. **Rotate values, not just recipients.** See
   [Rotation](#key-rotation--compromise-response).
 - **Compromised `identity.key`.** Anyone with the secret key can
   decrypt anything encrypted to their pubkey. Treat the file as a
-  credential of last resort: `0600`, never committed, store off-host
-  if you back it up.
+  credential of last resort: `0600`, never committed, FDE'd disk.
 - **Compromised `sops` or `age` binary.** `envless` does not verify
-  signatures on the shelled-out binaries. Pin versions, use your
-  distro's verified packages, or `cosign verify`.
+  signatures on the shelled-out binaries. Pin versions and use your
+  distro's verified packages.
 - **Side channels in your editor / shell history.** `envless get
   --confirm` prints plaintext. So does `echo $SECRET`. If you type
   the secret on stdin during `envless set`, your `bash` history will
   remember `echo "..." | envless set`. Use `read -s` or paste via a
   here-string with leading whitespace.
-- **Supply-chain attacks on Go modules.** `envless`'s direct deps are
-  three Go packages (cobra + transitive). The encryption substrate is
-  external binaries. See [Audit & supply chain](#audit--supply-chain).
+- **Supply-chain attacks on Go modules.** Three direct deps (cobra
+  family) plus age + sops as external binaries. See
+  [Audit & supply chain](#audit--supply-chain).
 - **Plaintext logs from your application.** If your code does
-  `console.log(process.env)`, that's on you, not on `envless`.
+  `console.log(process.env)`, that's on you, not on `envless`. See
+  [Logging & observability](#logging--observability).
 
 ### Trust boundaries
 
@@ -71,9 +111,20 @@ category error.
 | `sops` + `age` binaries on `PATH` | whoever installed them | full read of plaintext during decrypt |
 | Child process spawned by `exec` | inherits the env you injected | act on the secrets per your app's code |
 
-If your operations require a tighter trust model than this — RBAC,
-auditable access, ephemeral creds — see
-[When NOT to use envless](/envless/why/#when-not-to-use).
+### When NOT to use envless
+
+A compact decision table. If any row applies, `envless` is the wrong
+choice for at least that secret class — move it to a KMS.
+
+| Trigger | Why envless is wrong | What to use instead |
+|---|---|---|
+| **Team size > ~30 engineers** | Recipient management becomes a full-time job; no built-in RBAC. | Vault, AWS Secrets Manager. |
+| **Compliance regime** (PCI, HIPAA, SOC 2 with HSM, FedRAMP) | Auditor wants tamper-evident logs, HSM-backed keys, per-secret ACL. None exist here. | AWS KMS + Secrets Manager, GCP Secret Manager, Vault with HSM seal. |
+| **Need to revoke a single secret per-user without re-encrypting the file** | sops re-encrypts at file granularity. | Vault dynamic secrets, AWS IAM. |
+| **Auditable access logs** ("who read FOO at what time") | Filesystem reads are not logged. | KMS access logs (CloudTrail / Cloud Audit Logs). |
+| **Auto-rotating credentials** (DB creds that mint per-session) | envless is a static-secret tool. | Vault DB engine, AWS RDS IAM. |
+| **Regulated data domains** — financial transactions, PHI, government | The casual / opportunistic threat model is too weak. | Domain-specific managed services. |
+| **Secrets accessed by services without a human checkout step** | KMS workload identity (IRSA, GCP WI, Azure MI) is strictly safer than shipping `identity.key` to nodes. | Workload identity + KMS. |
 
 ## Cryptography (age + sops)
 
@@ -145,8 +196,7 @@ inside a child process — never on argv.
 - An attacker who reads `secrets/dev.env.enc` from the repo sees the
   key names but never the values without a matching age secret key.
 - Rotating one recipient does not re-encrypt existing files — `sops`
-  needs an explicit `sops updatekeys` invocation. `envless` does not
-  expose this yet; see [Rotation](#key-rotation--compromise-response).
+  needs an explicit `sops updatekeys` invocation. See [Rotation](#key-rotation--compromise-response).
 - The data key is symmetric (AES-256) — there is no asymmetric
   per-value encryption. Cracking one value worth of ciphertext does
   not extend to others, but compromising the data key compromises the
@@ -177,26 +227,48 @@ the most common mistake.
 
 Each requires a different response.
 
-### Identity rotation (someone leaves the project)
+### Identity rotation — recommended (sops updatekeys)
 
-When a recipient must lose access:
+When a recipient must lose access, the safer flow is to use `sops`
+directly. `envless` will gain `envless re-encrypt` in v0.1; until
+then, this is the recommended snippet (replaces the older
+decrypt-and-rewrite loop):
 
 ```bash
 # 1. Edit .envless/recipients — remove the departed pubkey.
 $EDITOR .envless/recipients
 
-# 2. Re-encrypt every env. v0.0.1 has no `envless re-encrypt`; the
-#    portable approach is decrypt → write → push:
-for env in dev prod; do
-  for key in $(envless list --env="$env"); do
-    val=$(envless get "$key" --env="$env" --confirm)
-    printf '%s' "$val" | envless set "$key" --env="$env"
-  done
+# 2. Materialise the new recipient list for sops as a .sops.yaml at
+#    repo root. envless does not write this file yet; you write it
+#    once and keep it in sync with .envless/recipients.
+cat > .sops.yaml <<EOF
+creation_rules:
+  - path_regex: ^secrets/.*\.env\.enc$
+    encrypted_regex: '.*'
+    key_groups:
+      - age:
+$(awk '/^[^#]/ {printf "          - %s\n", $1}' .envless/recipients)
+EOF
+
+# 3. Re-wrap the data key per file. The encrypted values are NOT
+#    re-encrypted, only the recipient-wrap headers are rewritten —
+#    fast, atomic, and avoids decrypt/encrypt round-trips.
+export SOPS_AGE_KEY_FILE="$PWD/.envless/identity.key"
+for f in secrets/*.env.enc; do
+  sops updatekeys --yes "$f"
 done
 
-# 3. Commit and push.
-git add .envless/recipients secrets/
-git commit -m "revoke departed recipient; re-encrypt envs"
+# 4. Verify the rewrap took effect — every recipient appears exactly
+#    once per file, and the departed pubkey is GONE.
+for f in secrets/*.env.enc; do
+  echo "== $f =="
+  grep -c '^- recipient:' "$f"   # should equal recipient count
+  grep "$OLD_PUBKEY" "$f" && echo "FAIL: stale recipient in $f"
+done
+
+# 5. Commit and push.
+git add .envless/recipients .sops.yaml secrets/
+git commit -m "revoke departed recipient; sops updatekeys re-wrap"
 git push
 ```
 
@@ -205,8 +277,36 @@ secret values* up to the moment of revocation. They retain that
 knowledge. Identity rotation does **not** protect against secrets they
 have already observed.
 
-If the recipient was hostile or compromised, treat every secret they
-could read as compromised and follow *secret rotation* below.
+**If the recipient was hostile or compromised, treat every secret
+they could read as compromised and follow [Secret rotation](#secret-rotation-a-credential-leaked)
+below.**
+
+### Identity rotation — fallback (decrypt → write → push)
+
+If you cannot or will not use `sops updatekeys` (e.g. you want full
+ciphertext rotation, not just a header rewrap), the portable approach
+through the `envless` CLI works on v0.0.1 with no additional config:
+
+```bash
+for env in dev prod; do
+  # Snapshot before for a verifiable diff.
+  envless exec --env="$env" -- env | sort > /tmp/envless-before-$env.txt
+
+  for key in $(envless list --env="$env"); do
+    val=$(envless get "$key" --env="$env" --confirm)
+    printf '%s' "$val" | envless set "$key" --env="$env"
+  done
+
+  # Snapshot after — values must match.
+  envless exec --env="$env" -- env | sort > /tmp/envless-after-$env.txt
+  diff /tmp/envless-before-$env.txt /tmp/envless-after-$env.txt \
+    || { echo "FAIL: $env diverged"; exit 1; }
+done
+```
+
+The diff is your safety net. If `diff` is non-empty, you broke
+something — restore from `git checkout HEAD -- secrets/` and retry.
+Doing this by hand without the diff check has caused real incidents.
 
 ### Secret rotation (a credential leaked)
 
@@ -220,7 +320,12 @@ NEW="sk-newvalue-xyz"
 # 2. Replace in envless.
 printf '%s' "$NEW" | envless set OPENAI_API_KEY --env=prod
 
-# 3. Commit and deploy.
+# 3. Verify the change is in the encrypted file but the old value is
+#    not anywhere in the working tree.
+git diff secrets/prod.env.enc | head     # encrypted blob changed
+grep -RIn 'sk-oldvalue' . | grep -v '.git/' && echo "STALE PLAINTEXT"
+
+# 4. Commit and deploy.
 git add secrets/prod.env.enc
 git commit -m "rotate OPENAI_API_KEY (provider rotation)"
 git push
@@ -232,8 +337,8 @@ that call the provider API for you.
 
 ### Identity loss (laptop stolen, key file leaked)
 
-This is the worst case: the secret key itself has escaped your
-control. Do, in order:
+The worst case: the secret key itself has escaped your control. Do,
+in order:
 
 1. **Treat every secret encrypted to that pubkey as compromised.**
    Anyone with the secret key can decrypt all current and prior
@@ -243,7 +348,7 @@ control. Do, in order:
    .envless/identity.key`).
 4. **Edit `.envless/recipients`** to replace the old pubkey with the
    new one.
-5. **Re-encrypt every env** as above.
+5. **`sops updatekeys`** every file (see above).
 6. **Force-push history rewrites only if you must** — Git history
    contains the encrypted files. They are unreadable without the lost
    key, but a defense-in-depth rewrite is fine.
@@ -253,8 +358,194 @@ control. Do, in order:
 - `envless panic` — single command for the steps above. Coming in v0.2.
 - `envless rotate KEY` — provider-aware rotation. v0.2.
 - `envless team revoke USER` — recipient management via CLI. v0.1.
+- `envless re-encrypt` — wraps `sops updatekeys`. v0.1.
 
-Until then, the manual sequences above are the supported workflow.
+Until then, the snippets above are the supported workflow.
+
+## Operational hardening checklist
+
+Concrete things to do on every developer machine and CI runner. Treat
+this as a copy-paste-and-tick list.
+
+### On every developer machine
+
+- [ ] **`.envless/identity.key` is `chmod 0600`.** `envless init` sets
+      this; verify after any restore from backup.
+      ```bash
+      stat -c '%a' .envless/identity.key   # must print "600"
+      ```
+- [ ] **Full-disk encryption is on.** FileVault (macOS) / LUKS
+      (Linux) / BitLocker (Windows). Without this, a lost laptop is a
+      full key compromise.
+- [ ] **No `identity.key` in cloud backup.** Exclude `.envless/` from
+      Dropbox, iCloud Drive, Time Machine cloud uploads. The file is
+      okay in encrypted local backups; it is not okay in any cloud
+      sync that you do not control the keys for.
+- [ ] **Shell history excludes secrets.** Set `HISTCONTROL=ignorespace`
+      and prefix any `envless set …` with a literal space when you
+      have to type a secret on the command line.
+- [ ] **Editor swap files aren't syncing.** Vim's `.swp`, Emacs's
+      `#file#`, IDE crash dumps. Add them to `.gitignore` and confirm
+      no sync tool grabs them from `~/.local/share/`.
+- [ ] **`age` and `sops` are installed from a trusted source.** macOS:
+      Homebrew taps. Linux: distro package or upstream checksums.
+      Pin versions in your team docs.
+
+### On CI / build runners
+
+- [ ] **Use workload identity, not a checked-in `identity.key`.**
+      GitHub Actions: store the key in a secret + write to the
+      runner with `chmod 0600` at job start. Strip it from the
+      workspace at job end. Never let it land in an artifact.
+- [ ] **The CI age key is its own recipient.** Do not reuse a
+      developer's `identity.key`. Generate one per environment, rotate
+      independently.
+- [ ] **CI runners do not retain state across jobs.** If you self-
+      host, ensure ephemeral runners. A long-lived runner is a
+      key-extraction target.
+- [ ] **Mask `envless exec` output in CI.** Most CI systems mask
+      values that match registered secrets. Register the env-var
+      *names*, not the values — or use `envless exec -- …` so the
+      values never appear in build logs at all.
+
+### Backup policy
+
+- [ ] **`identity.key` lives in a password manager**, not on disk
+      alongside the repo. 1Password / Bitwarden / `pass` are
+      acceptable.
+- [ ] **`recipients` lives in Git.** Public-key files are not
+      sensitive; their version history is a feature — every grant is
+      a code-reviewed PR.
+- [ ] **The encrypted `secrets/*.env.enc` files live in Git** and are
+      backed up by your normal Git workflow. No second backup needed.
+
+### Audit cadence
+
+| Cadence | What to check |
+|---|---|
+| Per-PR | `.envless/recipients` diff — every added pubkey gets a name and a date in the commit message. |
+| Monthly | `stat .envless/identity.key` permissions, expected list of recipients matches roster, `sops` + `age` versions match team pin. |
+| Quarterly | Rotate the data key by running `sops updatekeys -r --yes` (forces fresh data key) on every file. Free defense-in-depth. |
+| On any departure | Identity rotation (see above) within 24h. Secret rotation if the role had access to production. |
+
+## Logging & observability
+
+The most common way secrets leak after envless is in your *own*
+application logs. Defensive measures:
+
+### Application code
+
+- **Treat `process.env` as a credential, not a struct.** Never log it
+  whole. Never serialise it for error reporting. Never dump it on a
+  panic / unhandled-exception path.
+- **Use a masking library at the logging boundary.** Pino's
+  `redact:`, Python's `structlog` `drop_keys`, Go's `slog`
+  `ReplaceAttr` — whichever fits your stack. Mask any field whose
+  name matches `^([A-Z][A-Z0-9_]*)_?(KEY|TOKEN|SECRET|PASSWORD|PWD|CREDENTIAL|API|DSN|URI|URL|CONN(ECTION)?_STR(ING)?)?$`.
+- **Block error trackers from capturing env.** Sentry, Datadog, Rollbar
+  all collect environment by default. Disable: Sentry
+  `beforeSend` strip, Datadog `DD_LOG_TAGS` filter, Rollbar
+  `scrub_fields`.
+
+### Infrastructure
+
+- **Drop env vars from container debug introspection.** `docker inspect`
+  prints them by default. Use `--filter` or post-process before
+  shipping to logs.
+- **Kubernetes Pod manifests** committed to Git should never have
+  literal env values — only `valueFrom: secretKeyRef`. `envless exec`
+  injects at runtime; the manifest just declares names.
+- **Shell prompts that show env.** Some Powerlevel10k / Starship
+  configs include arbitrary env in the prompt. Audit your `~/.zshrc`
+  / `~/.config/starship.toml`.
+
+### Agent / LLM workflows
+
+This is where envless adds the most value vs naive `.env`, and where
+operators most often break the model.
+
+- **Never paste `envless get FOO --confirm` output into a prompt.**
+  Even with retention-zero providers, the value transits the
+  provider's API and may be cached.
+- **Use `envless exec -- agent-cli` instead of pre-resolving values.**
+  The child process gets the env; the agent's transcript does not.
+- **Agent tools that introspect the env** (e.g. "what's in your
+  environment?" answer-the-tool patterns) must be disabled or
+  filtered. `envless` cannot help once a tool itself reads
+  `process.env` and ships it upstream.
+
+## Integration patterns
+
+Three concrete shapes for how `envless` fits into a real stack. Pick
+the closest one and adapt.
+
+### Pattern 1 — Small SaaS team (3–10 engineers, one prod)
+
+```
+.envless/identity.key       — one per developer, password-manager backup
+.envless/recipients         — N developer pubkeys + 1 CI pubkey
+secrets/dev.env.enc         — dev / staging / prod, all in Git
+secrets/staging.env.enc
+secrets/prod.env.enc
+```
+
+- All secrets live in `envless`. No cloud secret manager.
+- CI uses its own age identity; production deploys `envless exec -- app`.
+- Quarterly `sops updatekeys -r` rotates the data key per env.
+- Rotation playbook: when an engineer leaves, identity rotation +
+  full secret rotation for prod (because they had production access).
+
+Cost: $0. Risk: moderate — relies on the casual / opportunistic
+threat tier holding.
+
+### Pattern 2 — Monorepo with N services
+
+```
+.envless/identity.key
+.envless/recipients         — devs + one CI key per service
+secrets/service-foo.dev.env.enc
+secrets/service-foo.prod.env.enc
+secrets/service-bar.dev.env.enc
+secrets/service-bar.prod.env.enc
+…
+```
+
+- One env file per `(service, env)` pair. Filenames encode the
+  ownership.
+- Service-specific CI keys: `foo`'s CI cannot decrypt `bar`'s
+  production env. Achieved with separate `.sops.yaml`
+  `creation_rules` per path prefix.
+- Recipients file groups: a comment header per group; the team
+  reviews recipient changes per service-owner team.
+- Cross-service shared secrets (e.g. shared DB) live in a
+  `secrets/shared.*.env.enc` file with the union of CI keys as
+  recipients.
+
+This pattern starts to strain at ~15 services. At that point,
+graduate the shared-secret class to a KMS and keep `envless` for the
+service-local class.
+
+### Pattern 3 — Cloud-native (KMS for prod, envless for dev/staging)
+
+```
+Dev / staging:  envless, as in Pattern 1
+Production:     AWS Secrets Manager / GCP Secret Manager / Vault
+```
+
+- Production secrets never enter `envless`. They live in the cloud
+  provider's KMS-backed manager.
+- Application code reads `process.env.STRIPE_KEY` in *both*
+  environments — but dev/staging gets it from `envless exec`, prod
+  gets it injected by IRSA / GCP Workload Identity / Vault Agent
+  sidecar.
+- The same code path, two injection mechanisms.
+- Compliance auditor sees "production has KMS-backed, access-logged,
+  HSM-rooted secrets" and "developer machines use a defence-in-depth
+  encrypted-file workflow." Both true.
+
+This is the recommended pattern for any team subject to compliance.
+The cost is one extra config layer (env-aware secret loader) and the
+discipline to never `envless set FOO --env=prod`.
 
 ## Audit & supply chain
 
@@ -339,15 +630,6 @@ Signed binaries (cosign) are a v1.0 goal — see the
 Report security issues by email rather than a public issue. See the
 GitHub repo's `SECURITY.md` (will be added before v0.1). For now, file
 a [private security advisory][gh-advisory].
-
-### What you should still audit yourself
-
-- The pinned versions of `age` and `sops` on your developer machines.
-  They are not part of the envless release artifact.
-- The `.envless/recipients` file in your repo — `git log -p
-  .envless/recipients` shows every access change.
-- The build provenance of `envless` itself if you build from source.
-  `go mod verify` confirms the dependency hashes match `go.sum`.
 
 [age]: https://age-encryption.org/v1
 [sops]: https://getsops.io/docs/
