@@ -79,6 +79,21 @@ Operationally: `git tag v0.X.0 && git push origin v0.X.0` is the
 canonical release path. CI does the rest (build → publish → bump
 brew formula → commit).
 
+## MCP server cwd scope (v0.2.x)
+
+`envless mcp` is rooted at the cwd of the process that launched it. That cwd is **whichever directory Claude Code (or the MCP client) was started in**. Consequence: one envless repo per MCP server instance.
+
+- `init` is the **only** tool that accepts an explicit `path` argument — useful for bootstrapping a fresh repo from elsewhere.
+- `set`, `get`, `list`, `migrate`, `whoami`, `envs` resolve `.envless/` from the MCP process cwd. They **do not** accept a cwd override.
+- `exec` accepts a `cwd` for the spawned child but the env-decrypt path still uses the MCP server's cwd.
+
+Practical implications:
+- Multi-repo workflows need separate Claude Code sessions, each launched in the target repo. Don't try to drive two envless repos from a single MCP session — you'll silently read from the first.
+- `init {"path":"/tmp/other-repo"}` creates `.envless/` there but subsequent `set` calls against the same MCP server will write to the original cwd's `.envless/` — confusing.
+- When testing the MCP server from a Claude Code session rooted at the envless repo itself, `init` (no path) creates `.envless/` in the repo root. Clean up afterwards (`rm -rf .envless secrets`) — identity.key is gitignored but `recipients` + `secrets/` are not.
+
+v0.3.x candidate: add optional `cwd` param to `set/get/list/migrate` so a single MCP server can target multiple envless repos. Until then, **one repo per MCP server**.
+
 ## Benchmark history storage
 
 Format: **JSONL** at `bench/history.jsonl` (one line = one bench run, keyed by `sha` + `timestamp`). Not SQLite, not per-SHA files-only.
