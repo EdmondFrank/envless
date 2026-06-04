@@ -410,3 +410,72 @@ test "TestE2E_Migrate" {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Help output (no external toolchain needed — runs in every environment).
+// ---------------------------------------------------------------------------
+
+test "help: top-level contains Examples section" {
+    const a = testing.allocator;
+    const bin = try resolveBin(a);
+    defer a.free(bin);
+
+    var out = try runEnvless(a, bin, null, null, &.{"-h"});
+    defer out.deinit(a);
+    try testing.expectEqual(@as(u8, 0), out.code);
+    if (std.mem.indexOf(u8, out.stdout, "Examples:") == null) {
+        std.debug.print("missing Examples section:\n{s}\n", .{out.stdout});
+        return error.TestMissingExamples;
+    }
+    if (std.mem.indexOf(u8, out.stdout, "envless init") == null) {
+        std.debug.print("missing 'envless init' in examples:\n{s}\n", .{out.stdout});
+        return error.TestMissingInitExample;
+    }
+}
+
+test "help: per-command help is shown" {
+    const a = testing.allocator;
+    const bin = try resolveBin(a);
+    defer a.free(bin);
+
+    var out = try runEnvless(a, bin, null, null, &.{ "exec", "-h" });
+    defer out.deinit(a);
+    try testing.expectEqual(@as(u8, 0), out.code);
+    inline for ([_][]const u8{ "Usage:", "envless exec", "Exit codes:" }) |needle| {
+        if (std.mem.indexOf(u8, out.stdout, needle) == null) {
+            std.debug.print("missing {s} in exec -h:\n{s}\n", .{ needle, out.stdout });
+            return error.TestMissingHelpSection;
+        }
+    }
+}
+
+test "help: -h goes to stdout exit 0" {
+    const a = testing.allocator;
+    const bin = try resolveBin(a);
+    defer a.free(bin);
+
+    var out = try runEnvless(a, bin, null, null, &.{"-h"});
+    defer out.deinit(a);
+    try testing.expectEqual(@as(u8, 0), out.code);
+    if (trim(out.stdout).len == 0) {
+        std.debug.print("expected non-empty stdout for -h\n", .{});
+        return error.TestUnexpectedEmpty;
+    }
+}
+
+test "help: unknown command exits 2" {
+    const a = testing.allocator;
+    const bin = try resolveBin(a);
+    defer a.free(bin);
+
+    var out = try runEnvless(a, bin, null, null, &.{"nonexistent-cmd"});
+    defer out.deinit(a);
+    if (out.code != 2) {
+        std.debug.print("want exit 2 for unknown cmd, got {d} stderr={s}\n", .{ out.code, out.stderr });
+        return error.TestUnexpectedExitCode;
+    }
+    if (std.mem.indexOf(u8, out.stderr, "unknown command") == null) {
+        std.debug.print("expected 'unknown command' in stderr:\n{s}\n", .{out.stderr});
+        return error.TestMissingUnknownCmdMsg;
+    }
+}
