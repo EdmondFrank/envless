@@ -18,11 +18,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: setup go
-        uses: actions/setup-go@v5
+      - name: pin zig version
+        id: zig
+        run: echo "version=$(cat zig/.zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: goto-bus-stop/setup-zig@v2
         with:
-          go-version: '1.26'
-          cache: true
+          version: ${{ steps.zig.outputs.version }}
 
       - name: install hyperfine + jq + age + sops
         run: |

@@ -5,26 +5,43 @@ on:
     branches: [main]
   pull_request:
 
+# Build, unit-test, and e2e-test the Zig envless binary on Linux.
+# The repo is full-Zig — there is no Go pipeline. macOS coverage comes
+# from contributors running `zig build test && zig build e2e` locally
+# (or, on macOS 26 / Tahoe, via the OrbStack workaround documented in
+# AGENTS.md).
 jobs:
-  test:
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+
+      - name: pin zig version
+        id: zig
+        run: echo "version=$(cat zig/.zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: goto-bus-stop/setup-zig@v2
         with:
-          go-version: '1.26'
-          cache: true
+          version: ${{ steps.zig.outputs.version }}
+
       - name: install age + sops
         run: |
           sudo apt-get update
           sudo apt-get install -y age
           curl -sSfL -o /tmp/sops https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64
           sudo install -m 0755 /tmp/sops /usr/local/bin/sops
-      - name: lint
+
+      - name: zig build test
+        working-directory: zig
+        run: zig build test
+
+      - name: zig build (release binary)
+        working-directory: zig
         run: |
-          go vet ./...
-          test -z "$(gofmt -l .)"
-      - name: test
-        run: go test -race -count=1 ./...
-      - name: build
-        run: go build -trimpath -o /tmp/envless ./cmd/envless
+          zig build -Doptimize=ReleaseSmall -Dversion=ci
+          test -x zig-out/bin/envless
+          zig-out/bin/envless --version
+
+      - name: zig build e2e
+        working-directory: zig
+        run: zig build e2e
