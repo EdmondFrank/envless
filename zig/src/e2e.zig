@@ -479,3 +479,262 @@ test "help: unknown command exits 2" {
         return error.TestMissingUnknownCmdMsg;
     }
 }
+
+// ---------------------------------------------------------------------------
+// MCP server E2E — drive `envless mcp` as a child, send NDJSON, parse replies.
+// ---------------------------------------------------------------------------
+
+/// runMcpScript: spawn `envless mcp`, write `script` to stdin, close, capture
+/// stdout/stderr until EOF.
+fn runMcpScript(
+    allocator: std.mem.Allocator,
+    bin: []const u8,
+    dir: ?[]const u8,
+    script: []const u8,
+) !RunOut {
+    var child = std.process.Child.init(&.{ bin, "mcp" }, allocator);
+    if (dir) |d| if (d.len != 0) {
+        child.cwd = d;
+    };
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+
+    if (child.stdin) |stdin| {
+        try stdin.writeAll(script);
+        stdin.close();
+        child.stdin = null;
+    }
+
+    var stdout_buf = std.ArrayList(u8).init(allocator);
+    errdefer stdout_buf.deinit();
+    var stderr_buf = std.ArrayList(u8).init(allocator);
+    errdefer stderr_buf.deinit();
+    try child.collectOutput(&stdout_buf, &stderr_buf, 4 * 1024 * 1024);
+
+    const term = try child.wait();
+    const code: u8 = switch (term) {
+        .Exited => |c| @intCast(c),
+        else => return error.UnexpectedTermination,
+    };
+    return RunOut{
+        .stdout = try stdout_buf.toOwnedSlice(),
+        .stderr = try stderr_buf.toOwnedSlice(),
+        .code = code,
+    };
+}
+
+test "TestE2E_McpInitializeAndToolsList" {
+    const a = testing.allocator;
+    const bin = try resolveBin(a);
+    defer a.free(bin);
+
+    const script =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"envs\",\"arguments\":{}}}\n";
+
+    const dir = try makeTmpDir(a);
+    defer a.free(dir);
+    defer rmTreeAbs(dir);
+
+    var out = try runMcpScript(a, bin, dir, script);
+    defer out.deinit(a);
+    try testing.expectEqual(@as(u8, 0), out.code);
+
+    // Three responses on stdout (one per id-bearing request). The
+    // notification produces no output.
+    var lines = std.mem.tokenizeScalar(u8, out.stdout, '\n');
+    var count: usize = 0;
+    var saw_initialize = false;
+    var saw_tools_list = false;
+    var saw_envs_call = false;
+    while (lines.next()) |line| {
+        count += 1;
+        // Sanity: each line is JSON with jsonrpc=2.0.
+        if (std.mem.indexOf(u8, line, "\"jsonrpc\":\"2.0\"") == null) {
+            std.debug.print("non-jsonrpc line: {s}\n", .{line});
+            return error.TestNonJsonRpc;
+        }
+        if (std.mem.indexOf(u8, line, "\"protocolVersion\":\"2024-11-05\"") != null) saw_initialize = true;
+        if (std.mem.indexOf(u8, line, "\"tools\":[") != null) saw_tools_list = true;
+        // envs in an empty dir returns an empty envs array.
+        if (std.mem.indexOf(u8, line, "\\\"envs\\\":[]") != null) saw_envs_call = true;
+    }
+    try testing.expectEqual(@as(usize, 3), count);
+    try testing.expect(saw_initialize);
+    try testing.expect(saw_tools_list);
+    try testing.expect(saw_envs_call);
+}
+
+test "TestE2E_McpWhoamiAfterInit" {
+    try skipIfMissing(&.{ "age-keygen", "sops" });
+    const a = testing.allocator;
+    const bin = try resolveBin(a);
+    defer a.free(bin);
+
+    const dir = try makeTmpDir(a);
+    defer a.free(dir);
+    defer rmTreeAbs(dir);
+
+    // Bootstrap an envless repo.
+    {
+        var out = try runEnvlessOk(a, bin, dir, null, &.{"init"});
+        defer out.deinit(a);
+    }
+
+    // whoami via MCP should report a pubkey + recipients=1.
+    const script =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"whoami\",\"arguments\":{}}}\n";
+    var out = try runMcpScript(a, bin, dir, script);
+    defer out.deinit(a);
+    try testing.expectEqual(@as(u8, 0), out.code);
+    if (std.mem.indexOf(u8, out.stdout, "age1") == null) {
+        std.debug.print("expected age1 pubkey in whoami output:\n{s}\n", .{out.stdout});
+        return error.TestMissingPubkey;
+    }
+    if (std.mem.indexOf(u8, out.stdout, "\\\"recipients\\\":1") == null) {
+        std.debug.print("expected recipients:1 in whoami output:\n{s}\n", .{out.stdout});
+        return error.TestMissingRecipients;
+    }
+}
+
+test "TestE2E_McpSetGetListRoundtrip" {
+    try skipIfMissing(&.{ "age-keygen", "sops" });
+    const a = testing.allocator;
+    const bin = try resolveBin(a);
+    defer a.free(bin);
+
+    const dir = try makeTmpDir(a);
+    defer a.free(dir);
+    defer rmTreeAbs(dir);
+
+    {
+        var out = try runEnvlessOk(a, bin, dir, null, &.{"init"});
+        defer out.deinit(a);
+    }
+
+    // set TOKEN=hello via MCP, then list, then get with confirm=true.
+    const script =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"set\",\"arguments\":{\"env\":\"dev\",\"key\":\"TOKEN\",\"value\":\"hello\"}}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"list\",\"arguments\":{\"env\":\"dev\"}}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"get\",\"arguments\":{\"env\":\"dev\",\"key\":\"TOKEN\",\"confirm\":true}}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"get\",\"arguments\":{\"env\":\"dev\",\"key\":\"TOKEN\"}}}\n";
+    var out = try runMcpScript(a, bin, dir, script);
+    defer out.deinit(a);
+    try testing.expectEqual(@as(u8, 0), out.code);
+
+    if (std.mem.indexOf(u8, out.stdout, "\\\"ok\\\":true") == null) {
+        std.debug.print("expected set ok=true:\n{s}\n", .{out.stdout});
+        return error.TestSetFailed;
+    }
+    if (std.mem.indexOf(u8, out.stdout, "\\\"keys\\\":[\\\"TOKEN\\\"]") == null) {
+        std.debug.print("expected keys=[TOKEN]:\n{s}\n", .{out.stdout});
+        return error.TestListFailed;
+    }
+    if (std.mem.indexOf(u8, out.stdout, "\\\"value\\\":\\\"hello\\\"") == null) {
+        std.debug.print("expected value=hello on get:\n{s}\n", .{out.stdout});
+        return error.TestGetFailed;
+    }
+    // get without confirm must error (isError=true).
+    if (std.mem.indexOf(u8, out.stdout, "\"isError\":true") == null) {
+        std.debug.print("expected isError=true for confirmless get:\n{s}\n", .{out.stdout});
+        return error.TestGetWithoutConfirm;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Daemon E2E (Linux-only by default — macOS Tahoe blocks Zig 0.13 locally).
+// ---------------------------------------------------------------------------
+
+test "TestE2E_DaemonPingAndList" {
+    // Daemon e2e shells out to age-keygen+sops via the cached decrypt path.
+    try skipIfMissing(&.{ "age-keygen", "sops" });
+    const a = testing.allocator;
+    const bin = try resolveBin(a);
+    defer a.free(bin);
+
+    const dir = try makeTmpDir(a);
+    defer a.free(dir);
+    defer rmTreeAbs(dir);
+
+    // Bootstrap a real envless repo so the daemon has something to decrypt.
+    {
+        var out = try runEnvlessOk(a, bin, dir, null, &.{"init"});
+        defer out.deinit(a);
+    }
+    {
+        var out = try runEnvlessOk(a, bin, dir, "hello", &.{ "set", "TOKEN" });
+        defer out.deinit(a);
+    }
+
+    // Pick a unique XDG_RUNTIME_DIR for this test so we never clash with
+    // a developer's daemon. Note: the spawned daemon inherits this.
+    const xdg = try std.fs.path.join(a, &.{ dir, ".xdg-rt" });
+    defer a.free(xdg);
+    try std.fs.makeDirAbsolute(xdg);
+
+    // Spawn the daemon in the background with HOME=dir, XDG_RUNTIME_DIR=xdg.
+    var child = std.process.Child.init(&.{ bin, "daemon" }, a);
+    child.cwd = dir;
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    var env_map = try std.process.getEnvMap(a);
+    defer env_map.deinit();
+    try env_map.put("HOME", dir);
+    try env_map.put("XDG_RUNTIME_DIR", xdg);
+    child.env_map = &env_map;
+    try child.spawn();
+    defer {
+        // Best-effort teardown.
+        _ = std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
+        _ = child.wait() catch {};
+    }
+
+    // Wait up to 2s for the socket to appear, then probe it with PING.
+    const sock_path = try std.fs.path.join(a, &.{ xdg, "envless", "sock" });
+    defer a.free(sock_path);
+
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        std.fs.accessAbsolute(sock_path, .{}) catch {
+            std.time.sleep(10 * std.time.ns_per_ms);
+            continue;
+        };
+        break;
+    }
+    if (attempts == 200) {
+        return error.SocketNeverAppeared;
+    }
+
+    // PING
+    {
+        var stream = try std.net.connectUnixSocket(sock_path);
+        defer stream.close();
+        try stream.writer().writeAll("PING\n");
+        var buf: [128]u8 = undefined;
+        const n = try stream.reader().read(&buf);
+        if (!std.mem.startsWith(u8, buf[0..n], "OK\t")) {
+            std.debug.print("ping reply unexpected: {s}\n", .{buf[0..n]});
+            return error.PingFailed;
+        }
+    }
+    // LIST dev
+    {
+        var stream = try std.net.connectUnixSocket(sock_path);
+        defer stream.close();
+        try stream.writer().writeAll("LIST\tdev\n");
+        var buf: [4096]u8 = undefined;
+        const n = try stream.reader().read(&buf);
+        const line = buf[0..n];
+        if (std.mem.indexOf(u8, line, "\"keys\":[\"TOKEN\"]") == null) {
+            std.debug.print("LIST reply unexpected: {s}\n", .{line});
+            return error.ListFailed;
+        }
+    }
+}

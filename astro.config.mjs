@@ -34,6 +34,7 @@ export default defineConfig({
         { label: 'Architecture', link: '/architecture/' },
         { label: 'Security', link: '/security/' },
         { label: 'CLI reference', link: '/cli/' },
+        { label: 'Agents (MCP)', link: '/agents/' },
         { label: 'Operations', link: '/operations/' },
         { label: 'Benchmarks', link: '/benchmarks/' },
         { label: 'Why envless', link: '/why/' },

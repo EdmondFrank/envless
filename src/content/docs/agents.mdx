@@ -1,0 +1,191 @@
+---
+title: Agents (MCP)
+description: Wire envless into Claude Code, Codex, Cursor, and Cline via the Model Context Protocol. Eight tools, JSON-RPC 2.0 over stdio, zero glue code.
+---
+
+`envless mcp` is the supported way for AI coding agents to read and
+write secrets — same encrypted store the CLI uses, same `sops` + `age`
+contract, exposed over the standard
+[Model Context Protocol](https://modelcontextprotocol.io). One agent
+config, eight tools, no shell quoting hazards.
+
+## Why MCP over `envless exec`?
+
+`envless exec` works fine when the agent has shell access. MCP wins
+when:
+
+- The agent runs in a sandboxed harness with no shell (Cursor's tool
+  surface, Cline's whitelist).
+- You want **typed tool arguments** instead of stringly-typed shell
+  args — `set(env="prod", key="OPENAI_API_KEY", value=...)` is harder
+  to misroute than `envless set OPENAI_API_KEY --env=prod < file`.
+- You want the agent to discover available envs / keys without first
+  shelling into `ls secrets/` and parsing filenames.
+- You want **`get` gated by an explicit `confirm:true` argument** that
+  the agent must construct on purpose — a far stronger guard than the
+  shell's `--confirm` flag.
+
+The eight tools — `envs`, `list`, `get`, `set`, `exec`, `init`,
+`migrate`, `whoami` — are documented in detail under
+[CLI → `envless mcp`](/envless/cli/#envless-mcp).
+
+## Transport
+
+`envless mcp` speaks JSON-RPC 2.0 over **stdio**, one request per
+newline (NDJSON). No LSP-style `Content-Length:` framing. Protocol
+version: MCP `2024-11-05`. Tools-only capability surface; no
+`prompts/*`, `resources/*`, or `sampling/*` in v1.
+
+The server is **stateless**: every `tools/call` is independent. When
+the [optional daemon](/envless/cli/#envless-daemon) is running, reads
+route through its decrypt cache automatically.
+
+## Wiring it in
+
+The configuration shape is identical across every MCP host — point
+the host at the `envless` binary with `mcp` as the only argument. The
+host launches it on demand and pipes JSON-RPC over its stdin/stdout.
+
+### Claude Code
+
+Edit your project's `.mcp.json` (or use the global
+`~/.claude/mcp_settings.json`):
+
+```json
+{
+  "mcpServers": {
+    "envless": {
+      "command": "envless",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+After reloading, the agent gains 8 new tools prefixed with `envless__`
+(`envless__envs`, `envless__list`, `envless__get`, …). They run in
+whichever directory you launched Claude Code from — the same place
+your `.envless/identity.key` lives.
+
+### Codex (OpenAI's CLI agent)
+
+Codex reads MCP servers from `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.envless]
+command = "envless"
+args = ["mcp"]
+```
+
+Refresh with `codex tools list`; the eight envless tools appear under
+the `envless` namespace.
+
+### Cursor
+
+Cursor's MCP support is configured under Settings → Features → MCP
+Servers. Add a new entry:
+
+- Name: `envless`
+- Command: `envless`
+- Args: `mcp`
+
+Cursor restarts the MCP process when the workspace changes, so
+`whoami` will reflect the new repo's identity automatically.
+
+### Cline (VS Code)
+
+In Cline's MCP settings panel, add:
+
+```json
+{
+  "envless": {
+    "command": "envless",
+    "args": ["mcp"],
+    "alwaysAllow": ["envs", "list", "whoami"]
+  }
+}
+```
+
+`alwaysAllow` is a Cline convention that skips the per-tool confirm
+dialog for low-risk reads. Keep `get`, `set`, `exec`, `init`, and
+`migrate` out of the list — those write or expose plaintext and
+deserve a click.
+
+### Generic MCP host
+
+Any host that speaks MCP `2024-11-05` over stdio works. The
+canonical handshake (see [CLI → `envless mcp`](/envless/cli/#envless-mcp)
+for a transcript):
+
+```
+client → server : initialize
+client ← server : capabilities (tools.listChanged=false)
+client → server : notifications/initialized
+client → server : tools/list
+client ← server : 8 tool descriptors
+client → server : tools/call (name, arguments)
+client ← server : { content: [...], isError: bool }
+```
+
+## Recommended tool policy
+
+The eight tools are not all equal-risk. A reasonable per-host
+allow/confirm matrix:
+
+| Tool | Read or write | Recommended policy |
+|---|---|---|
+| `envs` | read (no secrets) | always allow |
+| `list` | read (key names only) | always allow |
+| `whoami` | read (pubkey only) | always allow |
+| `get` | **read (plaintext value)** | per-call confirm; require human nod |
+| `set` | write | per-call confirm |
+| `init` | write (creates identity.key) | per-call confirm |
+| `migrate` | write (deletes plaintext .env) | per-call confirm |
+| `exec` | run subprocess with secrets injected | per-call confirm or session-scoped allow |
+
+`get` is the only tool that returns a plaintext secret value. The MCP
+server enforces `confirm:true` as a tool-level argument — even with
+your host configured to always-allow `get`, a malformed call without
+`confirm:true` will return `isError:true`. That is the second line of
+defense; the host's per-call confirm is the first.
+
+## Performance — pair with the daemon
+
+For agent workloads that hit `envless` dozens of times per minute, the
+sops cold-start tax adds up. Install the optional daemon:
+
+```bash
+envless daemon install
+```
+
+`envless mcp` auto-detects the daemon's UNIX socket on every
+`tools/call` and routes reads through it when present. First decrypt
+populates the cache; subsequent reads of the same `(repo, env)` pair
+are sub-millisecond until the file's mtime changes or the 60-second
+TTL elapses.
+
+The daemon is opt-in because it holds decrypted env in process memory
+— see [Security → Threat model](/envless/security/#what-envless-does-not-protect-against)
+and [Operations → Daemon mode](/envless/operations/#daemon-mode) for
+the tradeoff.
+
+## Troubleshooting
+
+**`whoami` returns an error mentioning `NoPubKeyMarker`** — the cwd
+doesn't have an `.envless/identity.key`. Either run `envless init`
+first, or call the `init` tool with the desired `path`.
+
+**`get` returns `confirm must be exactly true to return a secret`** —
+the host either omitted `confirm` or sent `confirm:false`. Send
+`confirm:true` as a JSON boolean (the string `"true"` is also
+accepted, but other strings and `1`/`0` are not).
+
+**`exec` returns `exit_code: -15` (or another negative number)** —
+the child was killed by signal. `-15` is SIGTERM, often because the
+300-second timeout fired. Break long-running commands into pieces or
+move them to a background job.
+
+**MCP host says "envless not found"** — the host couldn't resolve
+`envless` on its `PATH`. MCP hosts typically inherit the user's PATH
+but some sandbox it. Pass an absolute path in the config:
+`"command": "/usr/local/bin/envless"`.
