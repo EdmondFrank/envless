@@ -44,6 +44,20 @@ Workarounds (if you must benchmark Zig locally on macOS 26):
 
 Don't "fix" the Tahoe linker error by sprinkling `-lc` or `--sysroot` hacks in `build.zig`. The codebase ports cleanly to 0.14; the right move when this becomes painful is to bump `.zigversion` to 0.14 and update the stdlib calls.
 
+## Bash exception: bench/run.sh
+
+The repo is otherwise full-Zig (e2e harness, build, release, CI all in
+Zig). `bench/run.sh` is the single intentional bash exception — it
+orchestrates `hyperfine`, parses `/usr/bin/time` output, and shells `jq`
+for JSON munging. Porting it to Zig would be 500+ LOC of zero-value
+infrastructure code; bench harnesses are bash-native by tradition.
+
+If you ever do port it, the entrypoint contract is:
+- Build the Zig binary via `(cd zig && zig build -Doptimize=ReleaseSmall)`
+- Time each metric with hyperfine (or equivalent)
+- Emit one verbose JSON to `bench/results/<sha>.json`
+- Append one summary line to `bench/history.jsonl`
+
 ## Benchmark history storage
 
 Format: **JSONL** at `bench/history.jsonl` (one line = one bench run, keyed by `sha` + `timestamp`). Not SQLite, not per-SHA files-only.
