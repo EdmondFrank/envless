@@ -3,7 +3,7 @@ title: CLI reference
 description: Every subcommand, every flag, every exit code, every file format envless touches, and every environment variable it reads or sets. The single source of truth.
 ---
 
-`envless` has six subcommands plus a root version flag. The surface
+`envless` has seven subcommands plus a root version flag. The surface
 is deliberately flat — no nested groups, no hidden commands.
 
 ```
@@ -15,6 +15,7 @@ envless get    KEY                        [--env=ENV] --confirm
 envless list                              [--env=ENV]
 envless exec                              [--env=ENV] -- CMD [ARGS...]
 envless migrate FILE                      [--env=ENV] [--keep]
+envless backup                            [--output PATH] [--include-identity] [--yes]
 ```
 
 Default for `--env` is always `dev`.
@@ -163,6 +164,97 @@ MIGRATE  src=.env env=dev keys=3
 REMOVE   .env
 ```
 
+### `envless backup`
+
+Bundles envless state — `.envless/recipients`, every
+`secrets/<env>.env.enc`, and a `MANIFEST.json` — into a single
+`tar.gz`. The age secret key (`.envless/identity.key`) is **excluded
+by default** so the resulting tarball is safe to upload to any
+storage destination.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--output` | (stdout) | Path to write the tarball. `-` or omitted = stream to stdout (composes with `rclone rcat`, `gpg --symmetric`, etc.). |
+| `--include-identity` | `false` | Also include `.envless/identity.key`. Requires interactive confirmation, or `--yes` in non-interactive contexts. |
+| `--yes` | `false` | Bypass the interactive prompt when `--include-identity` is set. Required for scripts and cron. |
+
+Resolution: `envless backup` walks up from the current directory
+looking for `.envless/identity.key` and treats the dir containing it
+as the repo root. So you can run `envless backup` from any
+subdirectory of the project.
+
+Tarball layout:
+
+```
+MANIFEST.json
+.envless/recipients
+.envless/identity.key      # only when --include-identity
+secrets/dev.env.enc
+secrets/prod.env.enc
+…
+```
+
+`MANIFEST.json` schema (version 1):
+
+```json
+{
+  "schema_version": 1,
+  "envless_version": "v0.1.0",
+  "created_at": "2026-06-04T12:34:56Z",
+  "repo_root": "/Users/alice/my-app",
+  "pubkey": "age1...",
+  "includes_identity": false,
+  "envs": ["dev", "prod"],
+  "file_count": 4
+}
+```
+
+Output (file mode):
+
+```
+BACKUP  out=backup.tar.gz identity=excluded
+```
+
+Output (stdout mode): the raw tarball bytes go to stdout, nothing
+else; status messages all go to stderr so the pipe stays clean.
+
+Warnings emitted on stderr when `--include-identity` is set:
+
+```
+WARNING: --include-identity will write your age secret key into the
+backup tarball. Anyone who obtains this tarball can decrypt every
+secret you have access to.
+...
+```
+
+Examples:
+
+```bash
+# Safe default — recipients + encrypted envs + manifest, identity excluded.
+envless backup --output backup-$(date -u +%Y%m%d).tar.gz
+
+# Stream to a cloud sync without a local tempfile.
+envless backup | rclone rcat gdrive:envless-backups/$(date -u +%Y%m%d).tar.gz
+
+# Identity-included backup, GPG-encrypted before any storage.
+envless backup --include-identity --yes --output - \
+  | gpg --symmetric --cipher-algo AES256 \
+        --output backup.tar.gz.gpg
+```
+
+Exit codes specific to `backup`:
+
+- `0` — success.
+- `1` — user cancelled the `--include-identity` prompt.
+- `2` — usage error (e.g. `--include-identity` without `--yes` in a
+  non-TTY context).
+- `64` — configuration error: no `.envless/identity.key` found in
+  the current directory or any parent.
+- `74` — IO error (stage, tar invocation, file copy).
+
+See [Operations → Backup & restore](/envless/operations/#backup--restore)
+for upload-destination guidance and scheduled-backup recipes.
+
 ## Exit codes
 
 `envless` follows Unix conventions: `0` on success, non-zero on
@@ -203,6 +295,11 @@ child's exit code verbatim, and `get`, which fails fast without
 - **`envless migrate`** — `0` on success (and on `--keep`). `1` if
   the source file is missing, unreadable, fails to parse, or the
   encrypt step fails.
+- **`envless backup`** — `0` on success. `1` if the user cancels the
+  `--include-identity` prompt. `2` for usage errors, including
+  `--include-identity` in a non-TTY context without `--yes`. `64` if
+  no `.envless/identity.key` is found by walking up from cwd. `74`
+  for IO failures during staging or tar invocation.
 
 ### Implementation reference
 
@@ -444,6 +541,7 @@ parser deliberately small; richer parsing lands in v0.1.
 | `list` | [`zig/src/cli/list.zig`][gh-list] |
 | `exec` | [`zig/src/cli/exec.zig`][gh-exec] |
 | `migrate` | [`zig/src/cli/migrate.zig`][gh-migrate] |
+| `backup` | [`zig/src/cli/backup.zig`][gh-backup] + [`zig/src/backup.zig`][gh-backup-mod] |
 | root wiring | [`zig/src/cli/root.zig`][gh-root] |
 
 [age]: https://age-encryption.org/v1
@@ -454,6 +552,8 @@ parser deliberately small; richer parsing lands in v0.1.
 [gh-list]: https://github.com/biliboss/envless/blob/main/zig/src/cli/list.zig
 [gh-exec]: https://github.com/biliboss/envless/blob/main/zig/src/cli/exec.zig
 [gh-migrate]: https://github.com/biliboss/envless/blob/main/zig/src/cli/migrate.zig
+[gh-backup]: https://github.com/biliboss/envless/blob/main/zig/src/cli/backup.zig
+[gh-backup-mod]: https://github.com/biliboss/envless/blob/main/zig/src/backup.zig
 [gh-root]: https://github.com/biliboss/envless/blob/main/zig/src/cli/root.zig
 [gh-execenv]: https://github.com/biliboss/envless/blob/main/zig/src/execenv.zig
 [gh-sopswrap]: https://github.com/biliboss/envless/blob/main/zig/src/sops.zig
