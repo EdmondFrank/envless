@@ -13,9 +13,11 @@ import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DOCS_ROOT = resolve(__dirname, "..", "..");
-const REPO_ROOT = resolve(DOCS_ROOT, "..");
-const FALLBACK = join(DOCS_ROOT, "src", "data", "releases.json");
+// After the agent-tts pattern refactor, Astro lives at the repo root.
+// `src/lib/releases.ts` sits two levels under the repo root, so the Astro
+// root and the repo root are the same directory.
+const REPO_ROOT = resolve(__dirname, "..", "..");
+const FALLBACK = join(REPO_ROOT, "src", "data", "releases.json");
 const BENCH_DIR = join(REPO_ROOT, "bench", "results");
 const BENCH_HISTORY = join(REPO_ROOT, "bench", "history.jsonl");
 const REPO = "biliboss/envless";

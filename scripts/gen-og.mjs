@@ -1,4 +1,4 @@
-// Generates docs/public/og-image.png (1200x630) from an inline SVG.
+// Generates public/og-image.png (1200x630) from an inline SVG.
 // Run: node scripts/gen-og.mjs
 import sharp from "sharp";
 import { writeFileSync } from "node:fs";
