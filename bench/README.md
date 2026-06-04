@@ -1,9 +1,12 @@
 # `bench/` — envless DevOps metric harness
 
-This harness measures the operational cost of an envless binary so the Go → Zig
-migration (see `plans/reflective-churning-donut.md`) has a numeric target. It
-emits a single JSON file per git SHA, and a comparison script renders a
-markdown delta table that CI posts on PRs.
+This harness measures the operational cost of the envless Zig binary
+across releases. It emits a single JSON file per git SHA and a
+comparison script renders a markdown delta table that CI posts on PRs.
+
+> Note: `bench/run.sh` is the one intentional bash file in an otherwise
+> full-Zig repo — hyperfine orchestration is bash-native by tradition.
+> See AGENTS.md.
 
 ## Layout
 
@@ -13,7 +16,8 @@ bench/
   seed.sh        # deterministic 10-key repo, used by run.sh
   compare.sh     # diff two result files → markdown table
   results/       # one JSON per measured SHA, committed
-  REPORT.md      # baseline numbers + caveats (free-form)
+  history.jsonl  # one summary line per measured SHA, committed
+  REPORT.md      # methodology + caveats (free-form)
 ```
 
 ## Prereqs
@@ -23,12 +27,12 @@ bench/
 | `hyperfine` | statistical timing for build / cold start / list / exec |
 | `jq` | result aggregation in `run.sh`, delta math in `compare.sh` |
 | `sops`, `age` | envless shells out to these to seed the latency repo |
-| `go` | builds the Go binary, runs the e2e suite |
-| `zig` (optional) | enables the Zig toolchain leg once `zig/build.zig` lands |
+| `zig` | builds the Zig binary and runs the e2e suite |
 
-Install on macOS: `brew install hyperfine jq sops age`.
-Install on Debian/Ubuntu: `apt-get install hyperfine jq age` and grab a sops
-release tarball.
+Install on macOS: `brew install hyperfine jq sops age zig`.
+Install on Debian/Ubuntu: `apt-get install hyperfine jq age` and grab
+a sops release tarball; install Zig via the upstream tarball pinned to
+`zig/.zigversion`.
 
 ## Run locally
 
@@ -36,17 +40,20 @@ release tarball.
 # from repo root
 bench/run.sh
 # → bench/results/<git-sha>.json
+# → bench/history.jsonl (appended)
 ```
 
 The script:
 
-1. Builds `bin/envless` via `make build` and times it under hyperfine.
-2. If `zig/build.zig` exists, also builds `zig-out/bin/envless` and runs the
-   same suite against it.
-3. Seeds a throwaway envless repo (10 keys) via `bench/seed.sh`.
-4. Measures cold start, `envless list --env=dev`, `envless exec --env=dev -- true`,
-   peak RSS (`/usr/bin/time`), and the e2e suite wall-clock.
-5. Emits `bench/results/<sha>.json` with toolchain versions + OS/arch metadata.
+1. Builds `zig/zig-out/bin/envless` via `cd zig && zig build
+   -Doptimize=ReleaseSmall` and times it under hyperfine.
+2. Seeds a throwaway envless repo (10 keys) via `bench/seed.sh`.
+3. Measures cold start, `envless list --env=dev`, `envless exec
+   --env=dev -- true`, peak RSS (`/usr/bin/time`), and `zig build e2e`
+   wall-clock.
+4. Emits `bench/results/<sha>.json` with the Zig toolchain version +
+   OS/arch metadata.
+5. Appends a one-line summary to `bench/history.jsonl`.
 
 Any benchmark failure exits non-zero so CI surfaces the regression.
 
@@ -58,21 +65,20 @@ The JSON shape (`schema_version: 1`):
 {
   "git_sha": "…",
   "timestamp": "2026-…Z",
-  "platform":  { "os": "Darwin", "arch": "arm64" },
-  "toolchain_versions": { "go": "go1.26.0", "zig": null, "hyperfine": "1.18.0" },
+  "platform":  { "os": "Linux", "arch": "aarch64" },
+  "toolchain_versions": { "zig": "0.13.0", "hyperfine": "1.18.0" },
   "toolchains": [
     {
-      "label": "go",
-      "binary": "/.../bin/envless",
-      "binary_size_bytes": 2700000,
-      "build_time_sec":    { "mean": 0.42, "stddev": 0.01, "min": 0.40, "max": 0.45, "runs": 10 },
+      "label": "zig",
+      "binary": "/.../zig/zig-out/bin/envless",
+      "binary_size_bytes": 143000,
+      "build_time_sec":    { "mean": 0.05, "stddev": 0.01, "min": 0.04, "max": 0.07, "runs": 10 },
       "cold_start_sec":    { … },
       "list_latency_sec":  { … },
       "exec_latency_sec":  { … },
       "peak_rss_bytes":    5128192,
-      "e2e_wallclock_sec": 3.41
+      "e2e_wallclock_sec": 1.20
     }
-    // future: a second entry with label="zig"
   ]
 }
 ```

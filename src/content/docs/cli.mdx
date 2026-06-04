@@ -172,8 +172,8 @@ child's exit code verbatim, and `get`, which fails fast without
 | Code | Where it comes from | Meaning |
 |---|---|---|
 | `0` | every subcommand | success |
-| `1` | cobra / envless wrapper | unhandled error (missing arg, parse failure, file not found, sops error, `get` without `--confirm`, etc.) |
-| **N** | `envless exec` | child process exited with code N (propagated via [`execenv.ExitError`][gh-execenv]) |
+| `1` | envless dispatcher | unhandled error (missing arg, parse failure, file not found, sops error, `get` without `--confirm`, etc.) |
+| **N** | `envless exec` | child process exited with code N (propagated via [`execenv.RunResult.non_zero`][gh-execenv]) |
 | `127` | shell or OS | binary not found on `PATH` — comes from the shell, not from `envless` |
 
 ### Behaviour by subcommand
@@ -196,9 +196,9 @@ child's exit code verbatim, and `get`, which fails fast without
   does not interpret the code. `1` if `--` is followed by no command
   (`exec: missing command`). `1` if decryption fails before the
   child starts. Shell-level `127` if the command binary is not
-  found — that is the OS exec failure, not an `envless` exit. The
-  Go `os/exec` package surfaces this as `*exec.ExitError`, which
-  envless wraps and exits with `1`.
+  found — that is the OS exec failure, not an `envless` exit. Zig's
+  `std.process.Child` surfaces spawn failures as a build-side error,
+  which envless wraps and exits with `1`.
 - **`envless migrate`** — `0` on success (and on `--keep`). `1` if
   the source file is missing, unreadable, fails to parse, or the
   encrypt step fails.
@@ -206,29 +206,31 @@ child's exit code verbatim, and `get`, which fails fast without
 ### Implementation reference
 
 The `exec` propagation is the only non-trivial case. From
-[`internal/ecmd/exec.go`][gh-exec]:
+[`zig/src/cli/exec.zig`][gh-exec]:
 
-```go
-runErr := execenv.Run(args, child, os.Stdin, cmd.OutOrStdout(), cmd.ErrOrStderr())
-if runErr == nil {
-    return nil
-}
-var xe *execenv.ExitError
-if errors.As(runErr, &xe) {
-    os.Exit(xe.Code)
-}
-return runErr
+```zig
+const res = execenv.run(allocator, child_argv, child_env, ctx.stdin, ctx.stdout, ctx.stderr) catch |err| {
+    try ctx.stderr.writer().print("envless: exec: {s}\n", .{@errorName(err)});
+    return 1;
+};
+return switch (res) {
+    .success => 0,
+    .non_zero => |code| code,
+};
 ```
 
-And the `ExitError` definition from [`internal/execenv`][gh-execenv]:
+And the `RunResult` definition from
+[`zig/src/execenv.zig`][gh-execenv]:
 
-```go
-type ExitError struct{ Code int }
-func (e *ExitError) Error() string { return fmt.Sprintf("exit status %d", e.Code) }
+```zig
+pub const RunResult = union(enum) {
+    success,
+    non_zero: u8,
+};
 ```
 
-Any non-`ExitError` returned from the run path bubbles up to the
-cobra default handler, which prints to stderr and exits `1`.
+Any error returned from the run path is printed to stderr and the
+dispatcher exits with status `1`.
 
 ### Scripting against `envless exec`
 
@@ -270,15 +272,11 @@ not part of the contract.
 |---|---|---|
 | `SOPS_AGE_KEY_FILE` | `internal/sopswrap.Decrypt` | Points sops at `.envless/identity.key`. Set only on the `sops decrypt` child process — not exported to your shell. |
 
-The `sops` call ([`sopswrap.go`][gh-sopswrap]) builds its env like
-so:
-
-```go
-cmd.Env = append(os.Environ(), "SOPS_AGE_KEY_FILE="+identityFile)
-```
-
-So `SOPS_AGE_KEY_FILE` overrides any inherited value for the duration
-of the decrypt.
+The `sops` call ([`sops.zig`][gh-sopswrap]) builds its env by writing
+into a fresh `std.process.EnvMap` populated from `os.Environ()` plus
+the `SOPS_AGE_KEY_FILE` entry, then handing that map to
+`std.process.Child.env_map`. The override only applies for the duration
+of the decrypt child.
 
 ### Forwarded into `envless exec` children
 
@@ -289,18 +287,17 @@ of the decrypt.
 - Every entry from the decrypted secrets map. Secrets override
   matching parent keys.
 
-The merged set is sorted lexicographically and passed as `cmd.Env`.
-The merge logic is in [`internal/execenv.BuildEnv`][gh-execenv]:
+The merged set is sorted lexicographically and passed as the child's
+`env_map`. The merge logic is in [`execenv.buildEnv`][gh-execenv]:
 
-```go
-merged := map[string]string{}
-for _, e := range parent {
-    k, v, ok := strings.Cut(e, "=")
-    if !ok { continue }
-    merged[k] = v
+```zig
+for (parent) |e| {
+    const eq = std.mem.indexOfScalar(u8, e, '=') orelse continue;
+    try merged.put(e[0..eq], e[eq + 1 ..]);
 }
-for k, v := range kv {
-    merged[k] = v
+var it = kv.iterator();
+while (it.next()) |entry| {
+    try merged.put(entry.key_ptr.*, entry.value_ptr.*);
 }
 ```
 
@@ -393,7 +390,7 @@ dotenv --output-type dotenv`.
 - **Read by:** `sops decrypt` (with `SOPS_AGE_KEY_FILE`).
 
 Plaintext form before encryption (rendered by
-[`sopswrap.renderDotenv`][gh-sopswrap]):
+[`sops.renderDotenv`][gh-sopswrap]):
 
 - Sorted keys (lexicographic, byte-wise).
 - `KEY=VALUE\n` per line.
@@ -423,7 +420,7 @@ node_modules/
 ### `.env` (input only)
 
 The plaintext source for `envless migrate`. Parsed by
-[`pkg/envparse`][gh-envparse]:
+[`zig/src/envparse.zig`][gh-envparse]:
 
 - One assignment per line: `KEY=VALUE`.
 - `#`-prefixed lines and blank lines: ignored.
@@ -440,23 +437,23 @@ parser deliberately small; richer parsing lands in v0.1.
 
 | Subcommand | Source |
 |---|---|
-| `init` | [`internal/ecmd/init.go`][gh-init] |
-| `set` | [`internal/ecmd/set.go`][gh-set] |
-| `get` | [`internal/ecmd/get.go`][gh-get] |
-| `list` | [`internal/ecmd/list.go`][gh-list] |
-| `exec` | [`internal/ecmd/exec.go`][gh-exec] |
-| `migrate` | [`internal/ecmd/migrate.go`][gh-migrate] |
-| root wiring | [`internal/ecmd/root.go`][gh-root] |
+| `init` | [`zig/src/cli/init.zig`][gh-init] |
+| `set` | [`zig/src/cli/set.zig`][gh-set] |
+| `get` | [`zig/src/cli/get.zig`][gh-get] |
+| `list` | [`zig/src/cli/list.zig`][gh-list] |
+| `exec` | [`zig/src/cli/exec.zig`][gh-exec] |
+| `migrate` | [`zig/src/cli/migrate.zig`][gh-migrate] |
+| root wiring | [`zig/src/cli/root.zig`][gh-root] |
 
 [age]: https://age-encryption.org/v1
-[gh-envparse]: https://github.com/biliboss/envless/blob/main/pkg/envparse/envparse.go
-[gh-init]: https://github.com/biliboss/envless/blob/main/internal/ecmd/init.go
-[gh-set]: https://github.com/biliboss/envless/blob/main/internal/ecmd/set.go
-[gh-get]: https://github.com/biliboss/envless/blob/main/internal/ecmd/get.go
-[gh-list]: https://github.com/biliboss/envless/blob/main/internal/ecmd/list.go
-[gh-exec]: https://github.com/biliboss/envless/blob/main/internal/ecmd/exec.go
-[gh-migrate]: https://github.com/biliboss/envless/blob/main/internal/ecmd/migrate.go
-[gh-root]: https://github.com/biliboss/envless/blob/main/internal/ecmd/root.go
-[gh-execenv]: https://github.com/biliboss/envless/blob/main/internal/execenv/execenv.go
-[gh-sopswrap]: https://github.com/biliboss/envless/blob/main/internal/sopswrap/sopswrap.go
-[gh-store]: https://github.com/biliboss/envless/blob/main/internal/store/store.go
+[gh-envparse]: https://github.com/biliboss/envless/blob/main/zig/src/envparse.zig
+[gh-init]: https://github.com/biliboss/envless/blob/main/zig/src/cli/init.zig
+[gh-set]: https://github.com/biliboss/envless/blob/main/zig/src/cli/set.zig
+[gh-get]: https://github.com/biliboss/envless/blob/main/zig/src/cli/get.zig
+[gh-list]: https://github.com/biliboss/envless/blob/main/zig/src/cli/list.zig
+[gh-exec]: https://github.com/biliboss/envless/blob/main/zig/src/cli/exec.zig
+[gh-migrate]: https://github.com/biliboss/envless/blob/main/zig/src/cli/migrate.zig
+[gh-root]: https://github.com/biliboss/envless/blob/main/zig/src/cli/root.zig
+[gh-execenv]: https://github.com/biliboss/envless/blob/main/zig/src/execenv.zig
+[gh-sopswrap]: https://github.com/biliboss/envless/blob/main/zig/src/sops.zig
+[gh-store]: https://github.com/biliboss/envless/blob/main/zig/src/store.zig

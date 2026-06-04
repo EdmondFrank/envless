@@ -12,18 +12,19 @@ avoids stale screenshots.
 
 ## What gets measured
 
-The harness in `bench/run.sh` measures, on every commit
-to `main` and every release tag:
+The harness in `bench/run.sh` (the one intentional bash file in an
+otherwise full-Zig repo) measures, on every commit to `main` and every
+release tag:
 
 | Metric | Tool | What |
 |---|---|---|
-| **Build time** | `hyperfine` | Wall time for `make build` (or `zig build -Doptimize=ReleaseSmall` once Zig lands). 3 warmup, 10 measured runs. |
-| **Binary size** | `du -b bin/envless` | Bytes per OS/arch. Static, stripped. |
-| **Cold start** | `hyperfine` | `./bin/envless --version`. Fresh process, no warmup. |
-| **`envless exec` latency** | `hyperfine` | `./bin/envless exec --env=dev -- true` against a seeded repo with 10 keys. Captures full lifecycle: cobra parse → sops decrypt → fork/exec. |
-| **`envless list` latency** | `hyperfine` | `./bin/envless list --env=dev` against the same seeded repo. |
+| **Build time** | `hyperfine` | Wall time for `cd zig && zig build -Doptimize=ReleaseSmall`. 3 warmup, 10 measured runs. |
+| **Binary size** | `stat` | Bytes for `zig/zig-out/bin/envless`. Static, stripped. |
+| **Cold start** | `hyperfine` | `./envless --version`. Fresh process, no warmup. |
+| **`envless exec` latency** | `hyperfine` | `./envless exec --env=dev -- true` against a seeded repo with 10 keys. Captures full lifecycle: argv parse → sops decrypt → fork/exec. |
+| **`envless list` latency** | `hyperfine` | `./envless list --env=dev` against the same seeded repo. |
 | **Peak RSS** | `/usr/bin/time -v` | `Maximum resident set size` for the operations above. |
-| **E2E wall-clock** | `time` | `go test ./e2e/...`. The full e2e suite. |
+| **E2E wall-clock** | `time` | `zig build e2e`. The full e2e suite (build + 6 tests). |
 
 The full driver, knobs, and CI matrix are documented in `bench/run.sh`.
 
@@ -31,7 +32,7 @@ The full driver, knobs, and CI matrix are documented in `bench/run.sh`.
 
 ```
 bench/
-├── run.sh                  # the driver
+├── run.sh                  # the driver (the lone bash exception)
 ├── compare.sh              # delta-table generator
 ├── history.jsonl           # append-only summary index (one line per run)
 └── results/
@@ -62,23 +63,23 @@ table renders an empty-state row that links here.
 To reproduce the CI numbers locally, install `hyperfine` and run:
 
 ```bash
-hyperfine --warmup 3 --runs 10 './bin/envless --version'
-hyperfine --warmup 3 --runs 10 './bin/envless list --env=dev'
-hyperfine --warmup 3 --runs 10 './bin/envless exec --env=dev -- true'
+hyperfine --warmup 3 --runs 10 './zig/zig-out/bin/envless --version'
+hyperfine --warmup 3 --runs 10 './zig/zig-out/bin/envless list --env=dev'
+hyperfine --warmup 3 --runs 10 './zig/zig-out/bin/envless exec --env=dev -- true'
 ```
 
 Local laptops will be 20–50% off CI-measured runners — the absolute
 numbers only matter as deltas between commits on the same hardware.
 The changelog's delta column does the right thing.
 
-## Side-by-side: Go vs Zig
+## Historical Go data points
 
-The Zig binary is measured alongside the Go binary on the same harness.
-The parity goal is non-regression on every metric, with wins expected on
-cold start, binary size, and peak RSS.
+Pre-cutover runs measured both the (now-deleted) Go binary and the Zig
+port. Those lines remain in `bench/history.jsonl` for historical
+reference (filter by `metrics["go.*"]` to find them). Forward-looking
+comparisons measure Zig only — the Go column is frozen.
 
 ## Status
 
-Harness shipped; first Go baseline committed at `bench/results/<sha>.json`.
-Zig measurements activate automatically once `zig/build.zig` is present
-(it is).
+Harness shipped; Zig baseline committed at `bench/results/<sha>.json`.
+The Go leg was removed when the Go sources were deleted.

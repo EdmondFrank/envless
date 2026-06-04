@@ -216,9 +216,8 @@ same today as it will be in five years: Apache-2.0.
 
 ### Dependencies and their licenses
 
-`envless` is intentionally low-dependency. Run `go mod graph` (or
-read [`go.mod`][gh-gomod]) for the current set. The substrate it
-shells out to:
+`envless` is intentionally low-dependency. Zero runtime deps beyond
+Zig 0.13.0's stdlib + libc. The substrate it shells out to:
 
 - **age** — BSD-3-Clause.
 - **sops** — MPL-2.0.
@@ -293,4 +292,3 @@ GitHub.
 [sops]: https://getsops.io/docs/
 [apache]: https://www.apache.org/licenses/LICENSE-2.0
 [gh-license]: https://github.com/biliboss/envless/blob/main/LICENSE
-[gh-gomod]: https://github.com/biliboss/envless/blob/main/go.mod

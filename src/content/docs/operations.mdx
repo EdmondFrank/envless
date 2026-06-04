@@ -136,15 +136,14 @@ The file in the default branch of the repository is authoritative.
 A local edit means nothing until it lands in `main`. This is by
 design: PR review is the access-control workflow.
 
-The parser ([`store.Recipients()`][gh-store]) treats lines like this:
+The parser ([`store.recipients()`][gh-store]) treats lines like this:
 
-```go
-for _, line := range strings.Split(string(data), "\n") {
-    line = strings.TrimSpace(line)
-    if line == "" || strings.HasPrefix(line, "#") {
-        continue
-    }
-    out = append(out, line)
+```zig
+var it = std.mem.splitScalar(u8, data, '\n');
+while (it.next()) |raw| {
+    const line = std.mem.trim(u8, raw, " \t\r");
+    if (line.len == 0 or line[0] == '#') continue;
+    try out.append(try allocator.dupe(u8, line));
 }
 ```
 
@@ -328,8 +327,11 @@ jobs:
 
       - name: install envless
         run: |
-          curl -sSfL https://github.com/biliboss/envless/releases/latest/download/envless_linux_amd64.tar.gz \
-            | sudo tar -xz -C /usr/local/bin envless
+          # release tarballs are named envless_<version>_<target>.tar.gz
+          # and each unpacks to envless_<version>_<target>/envless
+          VER=v0.0.1
+          curl -sSfL "https://github.com/biliboss/envless/releases/download/$VER/envless_${VER}_x86_64-linux-gnu.tar.gz" \
+            | sudo tar -xz --strip-components=1 -C /usr/local/bin "envless_${VER}_x86_64-linux-gnu/envless"
 
       - name: provision identity from secret
         run: |
@@ -353,7 +355,7 @@ deploy:
     - apk add --no-cache age curl
     - curl -sSfL -o /tmp/sops https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64
     - install -m 0755 /tmp/sops /usr/local/bin/sops
-    - curl -sSfL https://github.com/biliboss/envless/releases/latest/download/envless_linux_amd64.tar.gz | tar -xz -C /usr/local/bin envless
+    - VER=v0.0.1; curl -sSfL "https://github.com/biliboss/envless/releases/download/$VER/envless_${VER}_x86_64-linux-gnu.tar.gz" | tar -xz --strip-components=1 -C /usr/local/bin "envless_${VER}_x86_64-linux-gnu/envless"
     - mkdir -p .envless && umask 077 && printf '%s' "$AGE_IDENTITY" > .envless/identity.key
   script:
     - envless exec --env=prod -- ./deploy.sh
@@ -366,11 +368,12 @@ deploy:
 Same shape, in a Dockerfile:
 
 ```dockerfile
-FROM golang:1.26-alpine AS build
+FROM alpine:3.20 AS build
 RUN apk add --no-cache age curl \
     && curl -sSfL -o /usr/local/bin/sops https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64 \
     && chmod +x /usr/local/bin/sops
-RUN curl -sSfL https://github.com/biliboss/envless/releases/latest/download/envless_linux_amd64.tar.gz | tar -xz -C /usr/local/bin envless
+RUN curl -sSfL https://github.com/biliboss/envless/releases/latest/download/envless_v0.0.1_x86_64-linux-gnu.tar.gz \
+    | tar -xz --strip-components=1 -C /usr/local/bin envless_v0.0.1_x86_64-linux-gnu/envless
 
 WORKDIR /src
 COPY . .
@@ -378,7 +381,7 @@ RUN --mount=type=secret,id=age_identity \
     mkdir -p .envless \
     && cp /run/secrets/age_identity .envless/identity.key \
     && chmod 0600 .envless/identity.key \
-    && envless exec --env=prod -- make build
+    && envless exec --env=prod -- ./build.sh
 ```
 
 Build with `docker build --secret id=age_identity,src=$HOME/.config/envless/ci.key .`.
@@ -407,4 +410,4 @@ Build with `docker build --secret id=age_identity,src=$HOME/.config/envless/ci.k
 Until then, the snippets above are the supported pattern.
 
 [age]: https://age-encryption.org/v1
-[gh-store]: https://github.com/biliboss/envless/blob/main/internal/store/store.go
+[gh-store]: https://github.com/biliboss/envless/blob/main/zig/src/store.zig

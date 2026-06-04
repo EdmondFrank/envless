@@ -3,7 +3,7 @@ title: Quickstart
 description: Install age + sops + envless, then go from zero to a running process with secrets injected — 60 seconds.
 ---
 
-`envless` is a Go binary that shells out to `age` and `sops`. You need
+`envless` is a Zig binary that shells out to `age` and `sops`. You need
 all three. Once they are on `PATH`, the entire init-set-exec loop is
 four commands.
 
@@ -35,14 +35,19 @@ sudo pacman -S age sops
 
 ### `envless` itself
 
-Clone + build until binaries are published:
+Download a pre-built binary from
+[GitHub Releases](https://github.com/biliboss/envless/releases), or
+clone + build from source:
 
 ```bash
 git clone https://github.com/biliboss/envless.git
-cd envless
-make build
-sudo install -m 0755 bin/envless /usr/local/bin/envless
+cd envless/zig
+zig build -Doptimize=ReleaseSmall
+sudo install -m 0755 zig-out/bin/envless /usr/local/bin/envless
 ```
+
+Building requires [Zig 0.13.0](https://ziglang.org/download/) — pinned
+in `zig/.zigversion`.
 
 ### Verify
 

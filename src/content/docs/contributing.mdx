@@ -3,16 +3,15 @@ title: Contributing
 description: Clone, build, test, release. The development setup, the testing conventions, and how an envless release is cut today.
 ---
 
-`envless` is a Go module today, with a Zig port in progress (see the
-[roadmap](/envless/why/#roadmap)). This page covers the full
-contributor surface: getting set up, writing tests that fit, and
-cutting a release.
+`envless` is a Zig module. This page covers the full contributor
+surface: getting set up, writing tests that fit, and cutting a release.
 
 ## Development setup
 
 ### Prerequisites
 
-- **Go 1.26+**
+- **Zig 0.13.0** — pinned in `zig/.zigversion`. Install from
+  [ziglang.org/download](https://ziglang.org/download/).
 - **age** ≥ 1.2 — `brew install age` / `apt install age`
 - **sops** ≥ 3.9 — install from
   [getsops/sops releases][sops-releases]
@@ -22,56 +21,44 @@ cutting a release.
 
 ```bash
 git clone https://github.com/biliboss/envless.git
-cd envless
+cd envless/zig
 
-make build
-# → bin/envless
+zig build
+# → zig-out/bin/envless
 
-./bin/envless --version
+./zig-out/bin/envless --version
 ```
 
-`make build` (see [`Makefile`][gh-makefile]) runs:
-
-```bash
-go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o bin/envless ./cmd/envless
-```
-
-`VERSION` defaults to `git describe --tags --always --dirty`,
-falling back to `dev`.
+`zig build` (see [`zig/build.zig`][gh-buildzig]) installs the binary
+at `zig-out/bin/envless`. For an optimised build pass
+`-Doptimize=ReleaseSmall`; for a version-stamped build pass
+`-Dversion=v0.X.Y`.
 
 ### Project layout
 
 ```
 .
-├── cmd/envless/main.go              # entrypoint (20 LOC)
-├── internal/
-│   ├── ecmd/                        # cobra subcommands
-│   ├── execenv/                     # env merge + child spawn
-│   ├── sopswrap/                    # sops binary wrapper
-│   └── store/                       # filesystem layout, KV
-├── pkg/envparse/                    # .env parser
-├── e2e/                             # all-Go e2e tests
-├── zig/                             # Zig port (Workstream A)
-├── bench/                           # benchmark harness + results
-├── src/                             # docs site (Astro + Starlight)
-├── public/                          # docs assets
-├── spec/                            # release acceptance specs
-└── .github/workflows/               # ci, release, docs
+├── zig/
+│   ├── build.zig                   # build graph (run, test, e2e, release)
+│   ├── .zigversion                 # pinned Zig version
+│   └── src/
+│       ├── main.zig                # entrypoint (21 LOC)
+│       ├── cli/                    # hand-rolled subcommand dispatcher
+│       ├── execenv.zig             # env merge + child spawn
+│       ├── sops.zig                # sops binary wrapper
+│       ├── store.zig               # filesystem layout, KV
+│       ├── envparse.zig            # .env parser
+│       └── e2e.zig                 # end-to-end test harness
+├── bench/                          # benchmark harness + results (one bash exception)
+├── src/                            # docs site (Astro + Starlight)
+├── public/                         # docs assets
+├── spec/                           # release acceptance specs
+└── .github/workflows/              # ci, release, docs, bench
 ```
-
-The `internal/` vs. `pkg/` split mirrors `cli/cli` (the GitHub CLI):
-`internal/` is closed-domain and stateful; `pkg/` is reusable
-utilities (`envparse` could be imported by an external Go project;
-the rest should not).
 
 ### Coding style
 
-- Standard Go style: `gofmt`, `go vet`, no extra lint config (yet).
-- `make lint` runs both:
-  ```bash
-  go vet ./...
-  test -z "$(gofmt -l .)"
-  ```
+- Standard Zig style: `zig fmt`. No extra lint config (yet).
 - Caveman output convention: one line per action, all caps verb,
   `key=value` fields. Examples from the codebase:
   ```
@@ -83,40 +70,40 @@ the rest should not).
 
 ### Adding a subcommand
 
-The pattern is one file per subcommand under `internal/ecmd/`,
-following the existing examples:
+One file per subcommand under `zig/src/cli/`, following the existing
+examples:
 
-```go
-// internal/ecmd/foo.go
-func newFooCmd() *cobra.Command {
-    var envName string
-    cmd := &cobra.Command{
-        Use:   "foo [args...]",
-        Short: "one-line description",
-        RunE: func(cmd *cobra.Command, args []string) error {
-            // ...
-            fmt.Fprintf(cmd.OutOrStdout(), "FOO  env=%s\n", envName)
-            return nil
-        },
-    }
-    cmd.Flags().StringVar(&envName, "env", "dev", "environment name")
-    return cmd
+```zig
+// zig/src/cli/foo.zig
+const std = @import("std");
+const root = @import("root.zig");
+
+pub fn run(ctx: *root.Context, args: []const []const u8) !u8 {
+    var rest = std.ArrayList([]const u8).init(ctx.allocator);
+    defer rest.deinit();
+    const env_opt = try root.popStringFlag(args, "--env", &rest);
+    const env = env_opt orelse "dev";
+    _ = rest;
+    try ctx.stdout.writer().print("FOO  env={s}\n", .{env});
+    return 0;
 }
 ```
 
-Wire it in `internal/ecmd/root.go`'s `root.AddCommand(...)`. Add unit
-tests next to it (`foo_test.go`) and add an `e2e/` scenario.
+Wire it in `zig/src/cli/root.zig`'s subcommand dispatch. Add inline
+tests at the bottom of the file (`test "..." { ... }`) and add a case
+to `zig/src/e2e.zig`.
 
 ### Running locally
 
 ```bash
-go run ./cmd/envless --version
-go run ./cmd/envless init
-echo "v" | go run ./cmd/envless set TEST
+cd zig
+zig build run -- --version
+zig build run -- init
+echo "v" | zig build run -- set TEST
 ```
 
-For repeated dev cycles, `make build` plus `./bin/envless` is faster
-because there's no compile-per-invocation.
+For repeated dev cycles, `zig build` plus `./zig-out/bin/envless` is
+faster because there's no compile-per-invocation.
 
 ### Docs site
 
@@ -131,40 +118,39 @@ pnpm build        # production build → dist/
 
 GH Pages deploys are handled by [`.github/workflows/docs.yml`][gh-docs-yml].
 
-### Once Zig lands
+### macOS 26 (Tahoe) blocker
 
-The Zig port (Workstream A) lives in `zig/` with its own `build.zig`.
-Until cutover, both binaries are exercised by the same `e2e/` test
-suite. See the [roadmap](/envless/why/#roadmap) for status.
+Zig 0.13.0's linker fails against the Tahoe SDK
+(`undefined symbol: _arc4random_buf`, etc.). Locally on macOS 26,
+build inside a Linux container (the documented OrbStack workflow in
+`AGENTS.md`). CI on Ubuntu is unaffected.
 
 ## Testing
 
 `envless` keeps a small, fast test surface. The whole suite runs in
-under three seconds on a laptop. The pattern: colocated unit tests,
-plus a top-level `e2e/` package that builds the real binary and
-shells out.
+under three seconds on a laptop. The pattern: inline `test "..."`
+blocks per module, plus a top-level `zig/src/e2e.zig` that builds the
+real binary and shells out.
 
 ### Running the suite
 
 ```bash
-make test
-# or
-go test -count=1 ./...
+cd zig
+zig build test        # 37 inline unit tests
+zig build e2e         # 6 end-to-end tests against the built binary
 ```
 
-CI runs `go test -race -count=1 ./...` (see
-[`.github/workflows/ci.yml`][gh-ci]). `-race` adds the data-race
-detector; we want it green on every PR.
+CI runs both on every PR (see [`.github/workflows/ci.yml`][gh-ci]).
 
 ### Layout
 
 | Path | Style | Purpose |
 |---|---|---|
-| `pkg/envparse/envparse_test.go` | Table-driven | Pure-logic parser tests. No I/O. |
-| `internal/execenv/execenv_test.go` | Table-driven | Env merge logic + `Run` against `/bin/sh`. |
-| `internal/sopswrap/sopswrap_test.go` | Skip-if-missing | Roundtrip through real `sops` + `age`. |
-| `internal/store/store_test.go` | Skip-if-missing | Full filesystem behaviour. |
-| `e2e/e2e_test.go` | Subprocess | Builds the binary in `TestMain` and runs it as a black box. |
+| `zig/src/envparse.zig` (inline tests) | Table-driven | Pure-logic parser tests. No I/O. |
+| `zig/src/execenv.zig` (inline tests) | Table-driven | Env merge logic + `run` against `/bin/sh`. |
+| `zig/src/sops.zig` (inline tests) | Skip-if-missing | Roundtrip through real `sops` + `age`. |
+| `zig/src/store.zig` (inline tests) | Skip-if-missing | Full filesystem behaviour. |
+| `zig/src/e2e.zig` | Subprocess | Spawns the binary in each test and asserts on stdout/stderr/exit. |
 
 The e2e suite is the executable spec — when a behaviour changes, the
 e2e test changes too. See [Architecture → Lifecycle of a
@@ -174,15 +160,14 @@ e2e case covers.
 ### The "skip if missing" pattern
 
 Tests that require `age-keygen` or `sops` use this helper from
-[`e2e/e2e_test.go`][gh-e2e]:
+[`zig/src/e2e.zig`][gh-e2e]:
 
-```go
-func skipIfMissing(t *testing.T, bins ...string) {
-    t.Helper()
-    for _, b := range bins {
-        if _, err := exec.LookPath(b); err != nil {
-            t.Skipf("%s not installed", b)
-        }
+```zig
+fn skipIfMissing(comptime bins: []const []const u8) !void {
+    const a = testing.allocator;
+    inline for (bins) |b| {
+        const ok = lookPath(a, b) catch false;
+        if (!ok) return error.SkipZigTest;
     }
 }
 ```
@@ -195,34 +180,25 @@ them.
 
 For a new subcommand, add two:
 
-1. **Unit test** next to the implementation. Keep it pure-logic
-   wherever possible — use `cobra.Command.SetIn/SetOut/SetErr` to
-   inject buffers.
-2. **E2E case** in `e2e/e2e_test.go`. Follow the existing pattern:
-   `t.TempDir()` per test, `envlessRun(t, dir, stdin, args...)`,
-   assert on stdout/stderr/exit code.
+1. **Inline `test` block** next to the implementation. Keep it
+   pure-logic wherever possible.
+2. **E2E case** in `zig/src/e2e.zig`. Follow the existing pattern:
+   `makeTmpDir()` per test, `runEnvlessOk(...)`, assert on
+   stdout/stderr/exit code.
 
 Table-driven where it pays off:
 
-```go
-func TestParse(t *testing.T) {
-    cases := []struct {
-        name string
-        in   string
-        want []Entry
-    }{
-        {"empty", "", nil},
-        {"single", "A=1\n", []Entry{{"A", "1"}}},
+```zig
+test "parse" {
+    const cases = [_]struct { name: []const u8, in: []const u8, want: []const Entry }{
+        .{ .name = "empty", .in = "", .want = &.{} },
+        .{ .name = "single", .in = "A=1\n", .want = &.{ .{ "A", "1" } } },
         // ...
-    }
-    for _, tc := range cases {
-        t.Run(tc.name, func(t *testing.T) {
-            got, err := Parse([]byte(tc.in))
-            if err != nil { t.Fatal(err) }
-            if !reflect.DeepEqual(got, tc.want) {
-                t.Fatalf("got %v, want %v", got, tc.want)
-            }
-        })
+    };
+    for (cases) |tc| {
+        const got = try parse(testing.allocator, tc.in);
+        defer freeEntries(testing.allocator, got);
+        try testing.expectEqualSlices(Entry, tc.want, got);
     }
 }
 ```
@@ -239,54 +215,49 @@ func TestParse(t *testing.T) {
 
 - **No mocks for `sops` or `age`.** They are real binaries; the e2e
   suite uses them. Mocking the boundary defeats the test's purpose.
-- **No `t.Sleep`** to "wait for sops to finish." `exec.Cmd.Run()` is
-  synchronous. If you find yourself wanting a sleep, look harder.
-- **No global fixtures** beyond what `TestMain` sets up. Each test
-  gets its own `t.TempDir()`.
+- **No `std.time.sleep`** to "wait for sops to finish."
+  `std.process.Child.spawnAndWait` is synchronous. If you find
+  yourself wanting a sleep, look harder.
+- **No global fixtures.** Each e2e test gets its own `makeTmpDir()`
+  and cleans it up.
 - **No flaky network calls.** v0.0.1 makes none — keep it that way.
 
 ### Suite-time budget
 
-We target sub-3-second `go test ./...` because slow tests stop
-getting run. The e2e cases that shell out to `sops` each take
-~200ms; that is the budget, not a license to add more. If a new
-case takes longer than 500ms, profile it.
+We target sub-3-second `zig build test && zig build e2e` because slow
+tests stop getting run. The e2e cases that shell out to `sops` each
+take ~200 ms; that is the budget, not a license to add more. If a new
+case takes longer than 500 ms, profile it.
 
 ## Release process
 
-`envless` releases on Git tags. The process is largely automated by
-[GoReleaser][gr] and GitHub Actions. The current flow plus the
-intended automated flow (once Workstream B closes) are documented
-here side-by-side.
+`envless` releases on Git tags. The process is automated by
+GitHub Actions.
 
-### Current release flow (`v0.0.1`)
+### Release flow
 
 The pipeline ([`.github/workflows/release.yml`][gh-release-yml])
 triggers on `push: tags: ['v*']`:
 
-1. Check out at depth 0 (so goreleaser can read the full history).
-2. Set up Go 1.26.
-3. Run `goreleaser release --clean` with `GITHUB_TOKEN` from the
-   workflow.
-
-GoReleaser ([`.goreleaser.yaml`][gh-goreleaser]) emits, for each
-`{linux,darwin} × {amd64,arm64}`:
-
-- A static binary built with `CGO_ENABLED=0 -trimpath -ldflags "-s
-  -w -X main.version=<tag>"`.
-- A `.tar.gz` archive named
-  `envless_<version>_<os>_<arch>.tar.gz`.
-- A `checksums.txt` with SHA-256 of every archive.
-
-The release is created as a **draft** (`release.draft: true`). A
-maintainer flips it to "Published" once the assets are verified.
+1. Check out at depth 0.
+2. Set up Zig 0.13.0 (`goto-bus-stop/setup-zig@v2`).
+3. Run `zig build release -Dversion=${{ github.ref_name }}` from
+   `zig/`. This cross-builds the binary for the four release targets
+   (`x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-macos`,
+   `aarch64-macos`), produces one `dist/envless_<version>_<target>.tar.gz`
+   per target, and writes `dist/checksums.txt` with one `<sha256>
+   <basename>` line per tarball.
+4. Verify: exactly four tarballs plus a `checksums.txt`.
+5. Publish a **draft** GitHub Release with all tarballs and the
+   checksums file attached, via `softprops/action-gh-release@v2`. A
+   maintainer flips it to "Published" once the assets are verified.
 
 ### Cutting a release locally
 
 ```bash
 # 1. Make sure main is green and the changes you want are in.
 git checkout main && git pull
-make test
+cd zig && zig build test && zig build e2e
 
 # 2. Bump the spec / docs as needed, then tag.
 git tag v0.0.2
@@ -300,57 +271,12 @@ The docs site is rebuilt by [`docs.yml`][gh-docs-yml] on the next
 push to `main` (or via `workflow_dispatch`). The Changelog page
 picks up the new release from the GH API; no doc edits required.
 
-### Intended automated flow (Workstream B)
+### Bench artifacts
 
-The end state is a single tag push that produces:
-
-1. Cross-built binaries (today).
-2. **Bench artifacts** — `bench/run.sh` runs against the release SHA
-   on a known runner and commits the result to
-   `bench/results/<sha>.json` on `main`.
-3. **A published GitHub Release** (no draft, signed assets).
-4. **Docs site rebuild** — picks up the release entry, joins to the
-   bench JSON, renders the perf delta inline.
-
-The proposed `release.yml` once Workstream B lands:
-
-```yaml
-name: release
-
-on:
-  push:
-    tags: ['v*']
-
-jobs:
-  bench:
-    runs-on: ubuntu-latest      # consistent runner = consistent numbers
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with: { go-version: '1.26' }
-      - run: sudo apt-get install -y hyperfine
-      - run: ./bench/run.sh
-      - uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "bench: record results for ${{ github.ref_name }}"
-          file_pattern: bench/results/*.json
-          branch: main
-
-  goreleaser:
-    needs: bench
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - uses: actions/setup-go@v5
-        with: { go-version: '1.26' }
-      - uses: goreleaser/goreleaser-action@v6
-        with: { args: release --clean }
-        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
-```
-
-Once that workflow exists, the only manual step in a release is the
-tag push.
+After a release tag lands, `bench.yml` runs `bench/run.sh` and
+appends a line to `bench/history.jsonl`; the docs changelog joins
+that line to the release for the perf-delta display. See
+[Benchmarks](/envless/benchmarks/) for the methodology.
 
 ### Versioning policy
 
@@ -374,10 +300,8 @@ Changelog page. Keep them:
   do not need to restate it in prose.
 
 [sops-releases]: https://github.com/getsops/sops/releases
-[gh-makefile]: https://github.com/biliboss/envless/blob/main/Makefile
+[gh-buildzig]: https://github.com/biliboss/envless/blob/main/zig/build.zig
 [gh-docs-yml]: https://github.com/biliboss/envless/blob/main/.github/workflows/docs.yml
 [gh-ci]: https://github.com/biliboss/envless/blob/main/.github/workflows/ci.yml
-[gh-e2e]: https://github.com/biliboss/envless/blob/main/e2e/e2e_test.go
-[gr]: https://goreleaser.com/
+[gh-e2e]: https://github.com/biliboss/envless/blob/main/zig/src/e2e.zig
 [gh-release-yml]: https://github.com/biliboss/envless/blob/main/.github/workflows/release.yml
-[gh-goreleaser]: https://github.com/biliboss/envless/blob/main/.goreleaser.yaml

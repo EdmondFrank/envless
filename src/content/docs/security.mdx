@@ -95,8 +95,9 @@ secrets manager.
   the secret on stdin during `envless set`, your `bash` history will
   remember `echo "..." | envless set`. Use `read -s` or paste via a
   here-string with leading whitespace.
-- **Supply-chain attacks on Go modules.** Three direct deps (cobra
-  family) plus age + sops as external binaries. See
+- **Supply-chain attacks on the Zig stdlib or vendored deps.**
+  `envless` ships zero runtime dependencies beyond Zig 0.13.0's
+  stdlib + libc; age + sops are external binaries. See
   [Audit & supply chain](#audit--supply-chain).
 - **Plaintext logs from your application.** If your code does
   `console.log(process.env)`, that's on you, not on `envless`. See
@@ -154,7 +155,7 @@ AGE-SECRET-KEY-1XQ...
 ```
 
 `envless` scans for the `# public key: ` marker to extract the pubkey
-for the recipients file. See [`store.PubKey()`][gh-store].
+for the recipients file. See [`store.pubKey()`][gh-store].
 
 ### sops — per-value encryption + metadata
 
@@ -171,7 +172,7 @@ and adds:
   dotenv exclusively.
 
 The exact invocations `envless` uses (from
-[`internal/sopswrap`][gh-sopswrap]):
+[`zig/src/sops.zig`][gh-sopswrap]):
 
 ```
 sops encrypt \
@@ -549,22 +550,19 @@ discipline to never `envless set FOO --env=prod`.
 
 ## Audit & supply chain
 
-`envless` is a small Go binary built from a small dependency graph.
+`envless` is a small Zig binary built from a small dependency graph.
 The audit surface is intentionally narrow.
 
 ### Direct dependencies
 
-From `go.mod` ([source][gh-gomod]):
+Zero runtime dependencies beyond Zig 0.13.0's stdlib + libc. The
+subcommand dispatcher, flag parser, dotenv parser, and sops/age
+shells are all hand-rolled in `zig/src/` (~1760 LOC including inline
+tests). No cobra, no pflag, no vendored crates — `zig build` runs
+against the pinned compiler version and produces a static binary.
 
-| Module | Version | Why |
-|---|---|---|
-| `github.com/spf13/cobra` | v1.10.2 | CLI subcommand wiring |
-| `github.com/spf13/pflag` | v1.0.9 | flag parsing (cobra transitive) |
-| `github.com/inconshreveable/mousetrap` | v1.1.0 | Windows entry-point shim (cobra transitive) |
-
-That is the entire transitive set. No HTTP clients, no JSON schemas,
-no YAML libraries, no SDKs. A `go mod graph` should print three
-lines.
+The only build-time fetch is the Zig compiler itself, pinned by
+`zig/.zigversion` and installed in CI via `goto-bus-stop/setup-zig@v2`.
 
 ### External binaries envless shells out to
 
@@ -596,30 +594,34 @@ explicit flag.
 ### Build provenance
 
 The release pipeline ([`.github/workflows/release.yml`][gh-release])
-uses [goreleaser] to cross-compile static binaries on
-`ubuntu-latest` GitHub-hosted runners. The build:
+runs `zig build release -Dversion=<tag>` on `ubuntu-latest`
+GitHub-hosted runners. The build:
 
-- Disables CGO (`CGO_ENABLED=0`) — pure-Go static binary.
-- Uses `-trimpath` and `-ldflags "-s -w"` — reproducible-ish output,
-  no debug symbols, no local paths leaking into the binary.
-- Targets `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`.
+- Pins Zig 0.13.0 via `goto-bus-stop/setup-zig@v2`.
+- Cross-compiles each target with `-Doptimize=ReleaseSmall` — small
+  stripped static binary, no debug symbols.
+- Targets `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-macos`,
+  `aarch64-macos`.
+- Produces `dist/envless_<version>_<target>.tar.gz` per target plus
+  `dist/checksums.txt` with one `<sha256>  <basename>` line per
+  tarball.
 
 The release tag is the only input. To reproduce a release locally:
 
 ```bash
 git checkout v0.0.1
-goreleaser release --snapshot --clean
-sha256sum dist/envless_*.tar.gz
+cd zig && zig build release -Dversion=v0.0.1
+shasum -a 256 ../dist/envless_*.tar.gz
 ```
 
 ### Verifying a downloaded binary
 
-GoReleaser emits `checksums.txt` next to each release. Verify:
+`zig build release` emits `checksums.txt` next to each release. Verify:
 
 ```bash
-curl -LO https://github.com/biliboss/envless/releases/download/v0.0.1/envless_0.0.1_linux_amd64.tar.gz
+curl -LO https://github.com/biliboss/envless/releases/download/v0.0.1/envless_v0.0.1_x86_64-linux-gnu.tar.gz
 curl -LO https://github.com/biliboss/envless/releases/download/v0.0.1/checksums.txt
-sha256sum -c --ignore-missing checksums.txt
+shasum -a 256 -c --ignore-missing checksums.txt
 ```
 
 Signed binaries (cosign) are a v1.0 goal — see the
@@ -637,11 +639,9 @@ a [private security advisory][gh-advisory].
 [sops-docs]: https://getsops.io/docs/
 [age-audits]: https://github.com/FiloSottile/age#security
 [sops-sec]: https://github.com/getsops/sops/security
-[gh-store]: https://github.com/biliboss/envless/blob/main/internal/store/store.go
-[gh-sopswrap]: https://github.com/biliboss/envless/blob/main/internal/sopswrap/sopswrap.go
-[gh-gomod]: https://github.com/biliboss/envless/blob/main/go.mod
+[gh-store]: https://github.com/biliboss/envless/blob/main/zig/src/store.zig
+[gh-sopswrap]: https://github.com/biliboss/envless/blob/main/zig/src/sops.zig
 [gh-release]: https://github.com/biliboss/envless/blob/main/.github/workflows/release.yml
 [gh-advisory]: https://github.com/biliboss/envless/security/advisories
 [age-gh]: https://github.com/FiloSottile/age
 [sops-gh]: https://github.com/getsops/sops
-[goreleaser]: https://goreleaser.com/

@@ -8,14 +8,14 @@ Agent-first secrets. Zero `.env`. Zero servers. `process.env` kept.
 
 ```bash
 # build
-make build
+cd zig && zig build -Doptimize=ReleaseSmall
 
 # in any project
 cd ~/your-project
-~/src/envless/bin/envless init                       # creates .envless/identity.key
-echo "sk-test-xyz" | ~/src/envless/bin/envless set OPENAI_API_KEY
-~/src/envless/bin/envless list                       # → OPENAI_API_KEY
-~/src/envless/bin/envless exec -- node server.js     # process.env.OPENAI_API_KEY populated
+~/src/envless/zig/zig-out/bin/envless init                       # creates .envless/identity.key
+echo "sk-test-xyz" | ~/src/envless/zig/zig-out/bin/envless set OPENAI_API_KEY
+~/src/envless/zig/zig-out/bin/envless list                       # → OPENAI_API_KEY
+~/src/envless/zig/zig-out/bin/envless exec -- node server.js     # process.env.OPENAI_API_KEY populated
 ```
 
 Multi-env:
@@ -47,24 +47,38 @@ envless migrate .env       # encrypts → secrets/dev.env.enc, removes .env, add
 
 - `age` >= 1.2 (`brew install age`)
 - `sops` >= 3.9 (`brew install sops`)
-- Go 1.26 (build only)
+- Zig 0.13.0 (build only) — pinned in `zig/.zigversion`
 
 ## Architecture
 
-- `cmd/envless/` — entrypoint
-- `internal/ecmd/` — cobra commands
-- `internal/store/` — file layout (.envless/, secrets/)
-- `internal/sopswrap/` — sops binary wrapper
-- `internal/execenv/` — env array build + child exec
-- `pkg/envparse/` — .env parser
+- `zig/src/main.zig` — entrypoint
+- `zig/src/cli/` — subcommand dispatcher (no cobra; hand-rolled)
+- `zig/src/store.zig` — file layout (.envless/, secrets/)
+- `zig/src/sops.zig` — sops binary wrapper
+- `zig/src/execenv.zig` — env array build + child exec
+- `zig/src/envparse.zig` — .env parser
 
-Single Go module. Apache-2.0.
+Single Zig binary, no runtime deps, ~150 KB stripped. Apache-2.0.
 
 ## Tests
 
 ```bash
-go test ./...     # 36 tests, < 3s
+cd zig
+zig build test     # 37 inline unit tests
+zig build e2e      # 6 end-to-end tests against the built binary
 ```
+
+## Release
+
+```bash
+cd zig
+zig build release -Dversion=v0.0.1
+# → dist/envless_v0.0.1_<target>.tar.gz × 4
+# → dist/checksums.txt
+```
+
+Cross-builds for `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-macos`,
+`aarch64-macos`.
 
 ## Roadmap
 
