@@ -38,28 +38,70 @@ const backup_cmd = @import("backup.zig");
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     cwd: []const u8, // owned
-    stdin: std.fs.File,
-    stdout: std.fs.File,
-    stderr: std.fs.File,
+    stdin: std.Io.File,
+    stdout: std.Io.File,
+    stderr: std.Io.File,
     version: []const u8,
+    _out_buf: [4096]u8 = undefined,
+    _err_buf: [4096]u8 = undefined,
 
     pub fn deinit(self: *Context) void {
         self.allocator.free(self.cwd);
     }
+
+    /// Create a buffered writer for stdout. Borrows `_out_buf` from self.
+    pub fn stdoutWriter(self: *Context) std.Io.File.Writer {
+        return self.stdout.writer(self.io, &self._out_buf);
+    }
+
+    /// Create a buffered writer for stderr. Borrows `_err_buf` from self.
+    pub fn stderrWriter(self: *Context) std.Io.File.Writer {
+        return self.stderr.writer(self.io, &self._err_buf);
+    }
+
+    /// One-shot stdout print (creates writer, prints, flushes).
+    pub fn outPrint(self: *Context, comptime fmt: []const u8, args: anytype) !void {
+        var w = self.stdoutWriter();
+        try w.interface.print(fmt, args);
+        try w.flush();
+    }
+
+    /// One-shot stdout writeAll (creates writer, writes, flushes).
+    pub fn outWriteAll(self: *Context, data: []const u8) !void {
+        var w = self.stdoutWriter();
+        try w.interface.writeAll(data);
+        try w.flush();
+    }
+
+    /// One-shot stderr print (creates writer, prints, flushes).
+    pub fn errPrint(self: *Context, comptime fmt: []const u8, args: anytype) !void {
+        var w = self.stderrWriter();
+        try w.interface.print(fmt, args);
+        try w.flush();
+    }
+
+    /// One-shot stderr writeAll (creates writer, writes, flushes).
+    pub fn errWriteAll(self: *Context, data: []const u8) !void {
+        var w = self.stderrWriter();
+        try w.interface.writeAll(data);
+        try w.flush();
+    }
 };
 
-pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, version: []const u8) !u8 {
-    var cwd_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-    const cwd_slice = try std.process.getCwd(&cwd_buf);
-    const cwd_owned = try allocator.dupe(u8, cwd_slice);
+pub fn run(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, version: []const u8) !u8 {
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    const cwd_owned = try allocator.dupe(u8, cwd_buf[0..cwd_len]);
 
     var ctx = Context{
         .allocator = allocator,
+        .io = io,
         .cwd = cwd_owned,
-        .stdin = std.io.getStdIn(),
-        .stdout = std.io.getStdOut(),
-        .stderr = std.io.getStdErr(),
+        .stdin = std.Io.File.stdin(),
+        .stdout = std.Io.File.stdout(),
+        .stderr = std.Io.File.stderr(),
         .version = version,
     };
     defer ctx.deinit();
@@ -72,7 +114,7 @@ pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, version: []co
     const sub = argv[1];
 
     if (std.mem.eql(u8, sub, "--version") or std.mem.eql(u8, sub, "-v")) {
-        try ctx.stdout.writer().print("envless version {s}\n", .{version});
+        try ctx.outPrint("envless version {s}\n", .{version});
         return 0;
     }
     if (std.mem.eql(u8, sub, "--help") or std.mem.eql(u8, sub, "-h") or std.mem.eql(u8, sub, "help")) {
@@ -92,8 +134,8 @@ pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, version: []co
     if (std.mem.eql(u8, sub, "daemon")) return daemon_cmd.run(&ctx, rest);
     if (std.mem.eql(u8, sub, "backup")) return backup_cmd.run(&ctx, rest);
 
-    try ctx.stderr.writer().print("envless: unknown command: {s}\n", .{sub});
-    try ctx.stderr.writer().writeAll("Run `envless -h` for the list of commands.\n");
+    try ctx.errPrint("envless: unknown command: {s}\n", .{sub});
+    try ctx.errWriteAll("Run `envless -h` for the list of commands.\n");
     return 2;
 }
 
@@ -106,10 +148,10 @@ pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, version: []co
 pub const Style = struct {
     enabled: bool,
 
-    pub fn fromFile(f: std.fs.File) Style {
+    pub fn fromFile(io: std.Io, f: std.Io.File) !Style {
         // NO_COLOR (https://no-color.org) and a non-TTY both disable ANSI.
-        if (std.process.hasEnvVarConstant("NO_COLOR")) return .{ .enabled = false };
-        return .{ .enabled = f.isTty() };
+        if (std.c.getenv("NO_COLOR") != null) return .{ .enabled = false };
+        return .{ .enabled = try f.isTty(io) };
     }
 
     pub fn bold(self: Style) []const u8 {
@@ -133,70 +175,71 @@ pub fn wantsHelp(args: []const []const u8) bool {
 }
 
 fn printUsage(ctx: *Context) !void {
-    const w = ctx.stdout.writer();
-    const s = Style.fromFile(ctx.stdout);
+    var w = ctx.stdoutWriter();
+    const s = try Style.fromFile(ctx.io, ctx.stdout);
     const b = s.bold();
     const d = s.dim();
     const r = s.reset();
 
-    try w.print("envless {s}— agent-first secrets, zero .env{s}\n\n", .{ d, r });
+    try w.interface.print("envless {s}— agent-first secrets, zero .env{s}\n\n", .{ d, r });
 
-    try w.print("{s}Usage:{s}\n", .{ b, r });
-    try w.writeAll("  envless <command> [flags] [args]\n\n");
+    try w.interface.print("{s}Usage:{s}\n", .{ b, r });
+    try w.interface.writeAll("  envless <command> [flags] [args]\n\n");
 
-    try w.print("{s}Commands:{s}\n", .{ b, r });
-    try w.writeAll("  init       initialize .envless/ in the current directory\n");
-    try w.writeAll("  set KEY    store a secret value from stdin (--env=NAME, default: dev)\n");
-    try w.writeAll("  get KEY    print a secret value (requires --confirm)\n");
-    try w.writeAll("  list       list keys in an env (does not print values)\n");
-    try w.writeAll("  exec       run a command with secrets injected as env vars\n");
-    try w.writeAll("  migrate    encrypt a .env file into envless and gitignore the plaintext\n");
-    try w.writeAll("  backup     emit a tar.gz of the encrypted artefacts (identity excluded)\n");
-    try w.writeAll("  mcp        run MCP server (JSON-RPC 2.0 over stdio) for agents\n");
-    try w.writeAll("  daemon     run/install/uninstall/status the optional decrypt-cache daemon\n\n");
+    try w.interface.print("{s}Commands:{s}\n", .{ b, r });
+    try w.interface.writeAll("  init       initialize .envless/ in the current directory\n");
+    try w.interface.writeAll("  set KEY    store a secret value from stdin (--env=NAME, default: dev)\n");
+    try w.interface.writeAll("  get KEY    print a secret value (requires --confirm)\n");
+    try w.interface.writeAll("  list       list keys in an env (does not print values)\n");
+    try w.interface.writeAll("  exec       run a command with secrets injected as env vars\n");
+    try w.interface.writeAll("  migrate    encrypt a .env file into envless and gitignore the plaintext\n");
+    try w.interface.writeAll("  backup     emit a tar.gz of the encrypted artefacts (identity excluded)\n");
+    try w.interface.writeAll("  mcp        run MCP server (JSON-RPC 2.0 over stdio) for agents\n");
+    try w.interface.writeAll("  daemon     run/install/uninstall/status the optional decrypt-cache daemon\n\n");
 
-    try w.writeAll("Run `envless <command> -h` for command-specific help.\n\n");
+    try w.interface.writeAll("Run `envless <command> -h` for command-specific help.\n\n");
 
-    try w.print("{s}Examples:{s}\n", .{ b, r });
-    try w.print("  {s}# First-time setup in a repo{s}\n", .{ d, r });
-    try w.writeAll("  envless init\n");
-    try w.writeAll("  echo \"sk-test-xyz\" | envless set OPENAI_API_KEY --env=dev\n");
-    try w.writeAll("  envless list --env=dev\n");
-    try w.writeAll("  envless exec --env=dev -- node server.js\n\n");
-    try w.print("  {s}# Multi-environment{s}\n", .{ d, r });
-    try w.writeAll("  echo \"sk-prod-real\" | envless set OPENAI_API_KEY --env=prod\n");
-    try w.writeAll("  envless exec --env=prod -- npm run deploy\n\n");
-    try w.print("  {s}# Migrate an existing .env file{s}\n", .{ d, r });
-    try w.writeAll("  envless migrate .env --env=dev\n\n");
-    try w.print("  {s}# Inspect without leaking values{s}\n", .{ d, r });
-    try w.writeAll("  envless list --env=staging\n");
-    try w.writeAll("  envless get DATABASE_URL --env=staging --confirm\n\n");
+    try w.interface.print("{s}Examples:{s}\n", .{ b, r });
+    try w.interface.print("  {s}# First-time setup in a repo{s}\n", .{ d, r });
+    try w.interface.writeAll("  envless init\n");
+    try w.interface.writeAll("  echo \"sk-test-xyz\" | envless set OPENAI_API_KEY --env=dev\n");
+    try w.interface.writeAll("  envless list --env=dev\n");
+    try w.interface.writeAll("  envless exec --env=dev -- node server.js\n\n");
+    try w.interface.print("  {s}# Multi-environment{s}\n", .{ d, r });
+    try w.interface.writeAll("  echo \"sk-prod-real\" | envless set OPENAI_API_KEY --env=prod\n");
+    try w.interface.writeAll("  envless exec --env=prod -- npm run deploy\n\n");
+    try w.interface.print("  {s}# Migrate an existing .env file{s}\n", .{ d, r });
+    try w.interface.writeAll("  envless migrate .env --env=dev\n\n");
+    try w.interface.print("  {s}# Inspect without leaking values{s}\n", .{ d, r });
+    try w.interface.writeAll("  envless list --env=staging\n");
+    try w.interface.writeAll("  envless get DATABASE_URL --env=staging --confirm\n\n");
 
-    try w.print("{s}Environment variables:{s}\n", .{ b, r });
-    try w.writeAll("  SOPS_AGE_KEY_FILE   path to the age identity file (default: .envless/identity.key)\n");
-    try w.writeAll("  EDITOR              editor used by interactive prompts (when applicable)\n");
-    try w.writeAll("  NO_COLOR            if set, disable ANSI colors in help output\n\n");
+    try w.interface.print("{s}Environment variables:{s}\n", .{ b, r });
+    try w.interface.writeAll("  SOPS_AGE_KEY_FILE   path to the age identity file (default: .envless/identity.key)\n");
+    try w.interface.writeAll("  EDITOR              editor used by interactive prompts (when applicable)\n");
+    try w.interface.writeAll("  NO_COLOR            if set, disable ANSI colors in help output\n\n");
 
-    try w.print("{s}Files:{s}\n", .{ b, r });
-    try w.writeAll("  .envless/identity.key   age secret key for this developer (chmod 0600, gitignored)\n");
-    try w.writeAll("  .envless/recipients     age pubkeys with read access (committed)\n");
-    try w.writeAll("  secrets/<env>.env.enc   sops-encrypted env files (committed)\n\n");
+    try w.interface.print("{s}Files:{s}\n", .{ b, r });
+    try w.interface.writeAll("  .envless/identity.key   age secret key for this developer (chmod 0600, gitignored)\n");
+    try w.interface.writeAll("  .envless/recipients     age pubkeys with read access (committed)\n");
+    try w.interface.writeAll("  secrets/<env>.env.enc   sops-encrypted env files (committed)\n\n");
 
-    try w.print("{s}Exit codes:{s}\n", .{ b, r });
-    try w.writeAll("  0   success\n");
-    try w.writeAll("  1   generic error\n");
-    try w.writeAll("  2   usage error (bad flags, missing args)\n");
-    try w.writeAll("  64  configuration error (missing .envless/, no identity)\n");
-    try w.writeAll("  65  data error (corrupt sops file)\n");
-    try w.writeAll("  66  not found (env / key not present)\n");
-    try w.writeAll("  74  IO error (filesystem, exec)\n\n");
+    try w.interface.print("{s}Exit codes:{s}\n", .{ b, r });
+    try w.interface.writeAll("  0   success\n");
+    try w.interface.writeAll("  1   generic error\n");
+    try w.interface.writeAll("  2   usage error (bad flags, missing args)\n");
+    try w.interface.writeAll("  64  configuration error (missing .envless/, no identity)\n");
+    try w.interface.writeAll("  65  data error (corrupt sops file)\n");
+    try w.interface.writeAll("  66  not found (env / key not present)\n");
+    try w.interface.writeAll("  74  IO error (filesystem, exec)\n\n");
 
-    try w.print("{s}Flags:{s}\n", .{ b, r });
-    try w.writeAll("  -h, --help        show this help\n");
-    try w.writeAll("      --version     print envless version\n\n");
+    try w.interface.print("{s}Flags:{s}\n", .{ b, r });
+    try w.interface.writeAll("  -h, --help        show this help\n");
+    try w.interface.writeAll("      --version     print envless version\n\n");
 
-    try w.writeAll("Docs: https://biliboss.github.io/envless/\n");
-    try w.writeAll("Repo: https://github.com/biliboss/envless\n");
+    try w.interface.writeAll("Docs: https://biliboss.github.io/envless/\n");
+    try w.interface.writeAll("Repo: https://github.com/biliboss/envless\n");
+    try w.flush();
 }
 
 // ----------------------------- shared helpers --------------------------------
@@ -210,7 +253,7 @@ pub const FlagParseError = error{
 /// "--env=value" and "--env value" forms. Returns the matched value (borrowed
 /// from argv) and removes both elements from `args_out`. If the flag is not
 /// present, returns null.
-pub fn popStringFlag(args: []const []const u8, name: []const u8, out_rest: *std.ArrayList([]const u8)) !?[]const u8 {
+pub fn popStringFlag(allocator: std.mem.Allocator, args: []const []const u8, name: []const u8, out_rest: *std.ArrayList([]const u8)) !?[]const u8 {
     var value: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -228,20 +271,20 @@ pub fn popStringFlag(args: []const []const u8, name: []const u8, out_rest: *std.
                 continue;
             }
         }
-        try out_rest.append(a);
+        try out_rest.append(allocator, a);
     }
     return value;
 }
 
 /// Pop a boolean flag (e.g. "--confirm"). Removes it from args.
-pub fn popBoolFlag(args: []const []const u8, name: []const u8, out_rest: *std.ArrayList([]const u8)) !bool {
+pub fn popBoolFlag(allocator: std.mem.Allocator, args: []const []const u8, name: []const u8, out_rest: *std.ArrayList([]const u8)) !bool {
     var found = false;
     for (args) |a| {
         if (std.mem.eql(u8, a, name)) {
             found = true;
             continue;
         }
-        try out_rest.append(a);
+        try out_rest.append(allocator, a);
     }
     return found;
 }
@@ -252,10 +295,10 @@ const testing = std.testing;
 
 test "popStringFlag --key=value" {
     const a = testing.allocator;
-    var rest = std.ArrayList([]const u8).init(a);
-    defer rest.deinit();
+    var rest: std.ArrayList([]const u8) = .empty;
+    defer rest.deinit(a);
     const args = [_][]const u8{ "set", "--env=prod", "KEY" };
-    const v = try popStringFlag(&args, "--env", &rest);
+    const v = try popStringFlag(a, &args, "--env", &rest);
     try testing.expect(v != null);
     try testing.expectEqualStrings("prod", v.?);
     try testing.expectEqual(@as(usize, 2), rest.items.len);
@@ -265,10 +308,10 @@ test "popStringFlag --key=value" {
 
 test "popStringFlag --key value" {
     const a = testing.allocator;
-    var rest = std.ArrayList([]const u8).init(a);
-    defer rest.deinit();
+    var rest: std.ArrayList([]const u8) = .empty;
+    defer rest.deinit(a);
     const args = [_][]const u8{ "--env", "prod", "KEY" };
-    const v = try popStringFlag(&args, "--env", &rest);
+    const v = try popStringFlag(a, &args, "--env", &rest);
     try testing.expect(v != null);
     try testing.expectEqualStrings("prod", v.?);
     try testing.expectEqual(@as(usize, 1), rest.items.len);
@@ -277,20 +320,20 @@ test "popStringFlag --key value" {
 
 test "popStringFlag absent returns null" {
     const a = testing.allocator;
-    var rest = std.ArrayList([]const u8).init(a);
-    defer rest.deinit();
+    var rest: std.ArrayList([]const u8) = .empty;
+    defer rest.deinit(a);
     const args = [_][]const u8{ "set", "KEY" };
-    const v = try popStringFlag(&args, "--env", &rest);
+    const v = try popStringFlag(a, &args, "--env", &rest);
     try testing.expect(v == null);
     try testing.expectEqual(@as(usize, 2), rest.items.len);
 }
 
 test "popBoolFlag" {
     const a = testing.allocator;
-    var rest = std.ArrayList([]const u8).init(a);
-    defer rest.deinit();
+    var rest: std.ArrayList([]const u8) = .empty;
+    defer rest.deinit(a);
     const args = [_][]const u8{ "get", "TOKEN", "--confirm" };
-    const v = try popBoolFlag(&args, "--confirm", &rest);
+    const v = try popBoolFlag(a, &args, "--confirm", &rest);
     try testing.expect(v);
     try testing.expectEqual(@as(usize, 2), rest.items.len);
 }

@@ -32,10 +32,11 @@ pub const Error = error{
 
 pub const Store = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     root: []const u8,
 
-    pub fn init(allocator: std.mem.Allocator, root: []const u8) Store {
-        return .{ .allocator = allocator, .root = root };
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, root: []const u8) Store {
+        return .{ .allocator = allocator, .io = io, .root = root };
     }
 
     pub fn identityPath(self: Store, buf_allocator: std.mem.Allocator) ![]u8 {
@@ -58,7 +59,7 @@ pub const Store = struct {
         const a = self.allocator;
         const dir = std.fs.path.join(a, &.{ self.root, ".envless" }) catch return Error.OutOfMemory;
         defer a.free(dir);
-        std.fs.cwd().makePath(dir) catch return Error.MkdirFailed;
+        std.Io.Dir.cwd().createDirPath(self.io, dir) catch return Error.MkdirFailed;
         // chmod 0700 on the directory (Go uses MkdirAll(... 0o700)).
         chmod(dir, 0o700) catch return Error.ChmodFailed;
 
@@ -67,25 +68,19 @@ pub const Store = struct {
 
         // If identity already exists, return (idempotent).
         const exists = blk: {
-            std.fs.cwd().access(id, .{}) catch break :blk false;
+            std.Io.Dir.cwd().access(self.io, id, .{}) catch break :blk false;
             break :blk true;
         };
         if (exists) return;
 
-        // Run age-keygen -o <id>. Pipe both stdout and stderr so we can drain
-        // them (collectOutput requires both to be .Pipe in Zig 0.13).
-        var child = std.process.Child.init(&.{ "age-keygen", "-o", id }, a);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-        child.spawn() catch return Error.AgeKeygenFailed;
-        var stdout_buf = std.ArrayList(u8).init(a);
-        defer stdout_buf.deinit();
-        var stderr_buf = std.ArrayList(u8).init(a);
-        defer stderr_buf.deinit();
-        child.collectOutput(&stdout_buf, &stderr_buf, 64 * 1024) catch return Error.AgeKeygenFailed;
-        const term = child.wait() catch return Error.AgeKeygenFailed;
-        switch (term) {
-            .Exited => |c| if (c != 0) return Error.AgeKeygenFailed,
+        // Run age-keygen -o <id>.
+        const r = std.process.run(a, self.io, .{
+            .argv = &.{ "age-keygen", "-o", id },
+        }) catch return Error.AgeKeygenFailed;
+        defer a.free(r.stdout);
+        defer a.free(r.stderr);
+        switch (r.term) {
+            .exited => |c| if (c != 0) return Error.AgeKeygenFailed,
             else => return Error.AgeKeygenFailed,
         }
 
@@ -96,10 +91,13 @@ pub const Store = struct {
 
         const rec_path = self.recipientsPath(a) catch return Error.OutOfMemory;
         defer a.free(rec_path);
-        var rec_file = std.fs.cwd().createFile(rec_path, .{ .truncate = true, .mode = 0o644 }) catch return Error.WriteFailed;
-        defer rec_file.close();
-        rec_file.writeAll(pub_key) catch return Error.WriteFailed;
-        rec_file.writeAll("\n") catch return Error.WriteFailed;
+        var rec_file = std.Io.Dir.cwd().createFile(self.io, rec_path, .{ .truncate = true }) catch return Error.WriteFailed;
+        defer rec_file.close(self.io);
+        var rec_buf: [4096]u8 = undefined;
+        var fw = rec_file.writer(self.io, &rec_buf);
+        fw.interface.writeAll(pub_key) catch return Error.WriteFailed;
+        fw.interface.writeAll("\n") catch return Error.WriteFailed;
+        fw.flush() catch return Error.WriteFailed;
     }
 
     /// recipients returns the list of age public keys for env (currently
@@ -110,13 +108,13 @@ pub const Store = struct {
         const a = self.allocator;
         const path = self.recipientsPath(a) catch return Error.OutOfMemory;
         defer a.free(path);
-        const data = std.fs.cwd().readFileAlloc(a, path, 1024 * 1024) catch return Error.ReadFailed;
+        const data = std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(1024 * 1024)) catch return Error.ReadFailed;
         defer a.free(data);
 
-        var list = std.ArrayList([]u8).init(a);
+        var list: std.ArrayList([]u8) = .empty;
         errdefer {
             for (list.items) |s| a.free(s);
-            list.deinit();
+            list.deinit(a);
         }
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |raw| {
@@ -124,10 +122,10 @@ pub const Store = struct {
             if (line.len == 0) continue;
             if (line[0] == '#') continue;
             const owned = a.dupe(u8, line) catch return Error.OutOfMemory;
-            list.append(owned) catch return Error.OutOfMemory;
+            list.append(a, owned) catch return Error.OutOfMemory;
         }
         if (list.items.len == 0) return Error.NoRecipients;
-        return list.toOwnedSlice() catch return Error.OutOfMemory;
+        return list.toOwnedSlice(a) catch return Error.OutOfMemory;
     }
 
     /// read returns the decrypted KV map for env. Returns an empty owned map
@@ -137,7 +135,7 @@ pub const Store = struct {
         const p = self.secretsPath(a, env) catch return Error.OutOfMemory;
         defer a.free(p);
         const exists = blk: {
-            std.fs.cwd().access(p, .{}) catch break :blk false;
+            std.Io.Dir.cwd().access(self.io, p, .{}) catch break :blk false;
             break :blk true;
         };
         if (!exists) {
@@ -148,7 +146,7 @@ pub const Store = struct {
         }
         const id = self.identityPath(a) catch return Error.OutOfMemory;
         defer a.free(id);
-        return sops.decrypt(a, p, id);
+        return sops.decrypt(self.io, a, p, id);
     }
 
     /// write encrypts kv for env using current recipients.
@@ -167,7 +165,7 @@ pub const Store = struct {
         const path = self.secretsPath(a, env) catch return Error.OutOfMemory;
         defer a.free(path);
 
-        return sops.encrypt(a, path, kv, view);
+        return sops.encrypt(self.io, a, path, kv, view);
     }
 
     /// set performs read-modify-write of a single key.
@@ -247,7 +245,7 @@ pub const Store = struct {
         const a = self.allocator;
         const id = self.identityPath(a) catch return Error.OutOfMemory;
         defer a.free(id);
-        const data = std.fs.cwd().readFileAlloc(a, id, 64 * 1024) catch return Error.ReadFailed;
+        const data = std.Io.Dir.cwd().readFileAlloc(self.io, id, a, .limited(64 * 1024)) catch return Error.ReadFailed;
         defer a.free(data);
         const marker = "# public key: ";
         var it = std.mem.splitScalar(u8, data, '\n');
@@ -263,8 +261,11 @@ pub const Store = struct {
 
 // chmod helper: portable across libc-linked targets.
 fn chmod(path: []const u8, mode: u32) !void {
-    var buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-    const c_path = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
+    var buf: [4096]u8 = undefined;
+    if (path.len >= buf.len) return error.PathTooLong;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const c_path = buf[0..path.len :0];
     const rc = std.c.chmod(c_path.ptr, @intCast(mode));
     if (rc != 0) return error.ChmodFailed;
 }
@@ -273,26 +274,29 @@ fn chmod(path: []const u8, mode: u32) !void {
 
 const testing = std.testing;
 
-fn binAvailable(name: []const u8) bool {
-    const a = testing.allocator;
-    var child = std.process.Child.init(&.{ name, "--version" }, a);
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return false;
-    _ = child.wait() catch return false;
+fn binAvailable(io: std.Io, name: []const u8) bool {
+    var child = std.process.spawn(io, .{
+        .argv = &.{ name, "--version" },
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .stdin = .ignore,
+    }) catch return false;
+    _ = child.wait(io) catch return false;
     return true;
 }
 
 test "init creates identity and returns age1 pubkey" {
-    if (!binAvailable("age-keygen")) return error.SkipZigTest;
+    if (!binAvailable(std.testing.io, "age-keygen")) return error.SkipZigTest;
     const a = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realpathAlloc(a, ".");
+    var _path_buf: [4096]u8 = undefined;
+    const _path_len = try tmp.dir.realPath(std.testing.io, &_path_buf);
+    const root = try a.dupe(u8, _path_buf[0.._path_len]);
     defer a.free(root);
 
-    const s = Store.init(a, root);
+    const s = Store.init(a, std.testing.io, root);
     try s.initStore();
     const pub_key = try s.pubKey();
     defer a.free(pub_key);
@@ -301,15 +305,17 @@ test "init creates identity and returns age1 pubkey" {
 }
 
 test "init is idempotent" {
-    if (!binAvailable("age-keygen")) return error.SkipZigTest;
+    if (!binAvailable(std.testing.io, "age-keygen")) return error.SkipZigTest;
     const a = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realpathAlloc(a, ".");
+    var _path_buf: [4096]u8 = undefined;
+    const _path_len = try tmp.dir.realPath(std.testing.io, &_path_buf);
+    const root = try a.dupe(u8, _path_buf[0.._path_len]);
     defer a.free(root);
 
-    const s = Store.init(a, root);
+    const s = Store.init(a, std.testing.io, root);
     try s.initStore();
     const p1 = try s.pubKey();
     defer a.free(p1);
@@ -320,15 +326,17 @@ test "init is idempotent" {
 }
 
 test "set then get roundtrip" {
-    if (!binAvailable("age-keygen") or !binAvailable("sops")) return error.SkipZigTest;
+    if (!binAvailable(std.testing.io, "age-keygen") or !binAvailable(std.testing.io, "sops")) return error.SkipZigTest;
     const a = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realpathAlloc(a, ".");
+    var _path_buf: [4096]u8 = undefined;
+    const _path_len = try tmp.dir.realPath(std.testing.io, &_path_buf);
+    const root = try a.dupe(u8, _path_buf[0.._path_len]);
     defer a.free(root);
 
-    const s = Store.init(a, root);
+    const s = Store.init(a, std.testing.io, root);
     try s.initStore();
     try s.set("dev", "OPENAI_API_KEY", "sk-test-xyz");
 
@@ -339,15 +347,17 @@ test "set then get roundtrip" {
 }
 
 test "read returns empty map when no secrets file" {
-    if (!binAvailable("age-keygen")) return error.SkipZigTest;
+    if (!binAvailable(std.testing.io, "age-keygen")) return error.SkipZigTest;
     const a = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realpathAlloc(a, ".");
+    var _path_buf: [4096]u8 = undefined;
+    const _path_len = try tmp.dir.realPath(std.testing.io, &_path_buf);
+    const root = try a.dupe(u8, _path_buf[0.._path_len]);
     defer a.free(root);
 
-    const s = Store.init(a, root);
+    const s = Store.init(a, std.testing.io, root);
     try s.initStore();
     var m = try s.read("dev");
     defer m.deinit();
@@ -355,15 +365,17 @@ test "read returns empty map when no secrets file" {
 }
 
 test "set preserves existing keys" {
-    if (!binAvailable("age-keygen") or !binAvailable("sops")) return error.SkipZigTest;
+    if (!binAvailable(std.testing.io, "age-keygen") or !binAvailable(std.testing.io, "sops")) return error.SkipZigTest;
     const a = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realpathAlloc(a, ".");
+    var _path_buf: [4096]u8 = undefined;
+    const _path_len = try tmp.dir.realPath(std.testing.io, &_path_buf);
+    const root = try a.dupe(u8, _path_buf[0.._path_len]);
     defer a.free(root);
 
-    const s = Store.init(a, root);
+    const s = Store.init(a, std.testing.io, root);
     try s.initStore();
     try s.set("dev", "A", "1");
     try s.set("dev", "B", "2");
@@ -377,15 +389,17 @@ test "set preserves existing keys" {
 }
 
 test "keys returns sorted key list with no values" {
-    if (!binAvailable("age-keygen") or !binAvailable("sops")) return error.SkipZigTest;
+    if (!binAvailable(std.testing.io, "age-keygen") or !binAvailable(std.testing.io, "sops")) return error.SkipZigTest;
     const a = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realpathAlloc(a, ".");
+    var _path_buf: [4096]u8 = undefined;
+    const _path_len = try tmp.dir.realPath(std.testing.io, &_path_buf);
+    const root = try a.dupe(u8, _path_buf[0.._path_len]);
     defer a.free(root);
 
-    const s = Store.init(a, root);
+    const s = Store.init(a, std.testing.io, root);
     try s.initStore();
     try s.set("dev", "Z", "v");
     try s.set("dev", "A", "v");

@@ -1,19 +1,7 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    // Use whatever target the user passed (`-Dtarget=...`) — but if none is
-    // given and we're on macOS, drop the OS version tag so Zig 0.13 stops
-    // probing the host SDK for symbols it doesn't ship (a known mismatch on
-    // recent macOS releases vs. Zig 0.13's bundled stubs).
-    var raw_target = b.standardTargetOptions(.{});
-    if (raw_target.result.os.tag == .macos and raw_target.query.os_version_min == null) {
-        raw_target.query.os_version_min = .{ .none = {} };
-        raw_target.query.os_version_max = .{ .none = {} };
-        // Re-resolve with the cleared version constraints.
-        raw_target = b.resolveTargetQuery(raw_target.query);
-    }
-    const target = raw_target;
-
+    const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
     const version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "dev";
@@ -22,23 +10,30 @@ pub fn build(b: *std.Build) void {
     const opts = b.addOptions();
     opts.addOption([]const u8, "version", version);
 
+    const io = b.graph.io;
+    const cwd = std.Io.Dir.cwd();
+
     // ---- main executable ----
     // Built only when src/main.zig exists; during the incremental port we may
     // not yet have it on disk, in which case we install nothing.
     const main_path = "src/main.zig";
     const have_main = blk: {
-        std.fs.cwd().access(b.pathFromRoot(main_path), .{}) catch break :blk false;
+        cwd.access(io, b.pathFromRoot(main_path), .{}) catch break :blk false;
         break :blk true;
     };
     if (have_main) {
-        const exe = b.addExecutable(.{
-            .name = "envless",
+        const exe_mod = b.createModule(.{
             .root_source_file = b.path(main_path),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         });
-        exe.linkLibC();
-        exe.root_module.addOptions("build_options", opts);
+        exe_mod.addOptions("build_options", opts);
+
+        const exe = b.addExecutable(.{
+            .name = "envless",
+            .root_module = exe_mod,
+        });
         b.installArtifact(exe);
 
         const run_cmd = b.addRunArtifact(exe);
@@ -52,13 +47,12 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
 
     const all_test_files = [_][]const u8{
+        "src/main.zig",
         "src/envparse.zig",
         "src/execenv.zig",
         "src/sops.zig",
         "src/store.zig",
         "src/backup.zig",
-        "src/cli/root.zig",
-        "src/cli/migrate.zig",
         "src/ipc.zig",
         "src/mcp.zig",
         "src/daemon.zig",
@@ -68,17 +62,23 @@ pub fn build(b: *std.Build) void {
     var test_files: [all_test_files.len][]const u8 = undefined;
     var n_tests: usize = 0;
     for (all_test_files) |path| {
-        std.fs.cwd().access(b.pathFromRoot(path), .{}) catch continue;
+        cwd.access(io, b.pathFromRoot(path), .{}) catch continue;
         test_files[n_tests] = path;
         n_tests += 1;
     }
     for (test_files[0..n_tests]) |path| {
-        const t = b.addTest(.{
+        const t_mod = b.createModule(.{
             .root_source_file = b.path(path),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         });
-        t.linkLibC();
+        // main.zig imports build_options; add it for all test modules
+        // so the import resolves (harmless for files that don't use it).
+        t_mod.addOptions("build_options", opts);
+        const t = b.addTest(.{
+            .root_module = t_mod,
+        });
         const run_t = b.addRunArtifact(t);
         test_step.dependOn(&run_t.step);
     }
@@ -91,12 +91,15 @@ pub fn build(b: *std.Build) void {
     // project root, so a relative fallback wouldn't resolve).
     if (have_main) {
         const e2e_step = b.step("e2e", "Run end-to-end tests against the built binary");
-        const e2e_t = b.addTest(.{
+        const e2e_mod = b.createModule(.{
             .root_source_file = b.path("src/e2e.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         });
-        e2e_t.linkLibC();
+        const e2e_t = b.addTest(.{
+            .root_module = e2e_mod,
+        });
         const run_e2e = b.addRunArtifact(e2e_t);
         run_e2e.step.dependOn(b.getInstallStep());
         // Compute an absolute path to zig-out/bin/envless via the install
@@ -133,22 +136,26 @@ pub fn build(b: *std.Build) void {
     const mkdir_dist = b.addSystemCommand(&.{ "mkdir", "-p", "../dist" });
 
     // Collect tarball basenames (used by the final checksums step).
-    var tar_names = std.ArrayList([]const u8).init(b.allocator);
+    var tar_names: std.ArrayList([]const u8) = .empty;
     // Each tar step is a dependency of the final checksum step so we know
     // every tarball exists by the time we shasum.
-    var tar_steps = std.ArrayList(*std.Build.Step).init(b.allocator);
+    var tar_steps: std.ArrayList(*std.Build.Step) = .empty;
 
     for (rel_targets) |rt| {
         const rel_target = b.resolveTargetQuery(rt.query);
 
-        const rel_exe = b.addExecutable(.{
-            .name = "envless",
+        const rel_mod = b.createModule(.{
             .root_source_file = b.path(main_path),
             .target = rel_target,
             .optimize = .ReleaseSmall,
+            .link_libc = true,
         });
-        rel_exe.linkLibC();
-        rel_exe.root_module.addOptions("build_options", opts);
+        rel_mod.addOptions("build_options", opts);
+
+        const rel_exe = b.addExecutable(.{
+            .name = "envless",
+            .root_module = rel_mod,
+        });
 
         // Stage the binary into a per-target dir
         // `envless_<version>_<triple>/envless` via WriteFiles. The
@@ -171,8 +178,8 @@ pub fn build(b: *std.Build) void {
         tar_cmd.step.dependOn(&mkdir_dist.step);
         release_step.dependOn(&tar_cmd.step);
 
-        tar_names.append(tar_name) catch @panic("OOM");
-        tar_steps.append(&tar_cmd.step) catch @panic("OOM");
+        tar_names.append(b.allocator, tar_name) catch @panic("OOM");
+        tar_steps.append(b.allocator, &tar_cmd.step) catch @panic("OOM");
     }
 
     // Write ../dist/checksums.txt with `<sha256>  <basename>` lines. We use
@@ -183,12 +190,13 @@ pub fn build(b: *std.Build) void {
     const checksum_cmd = b.addSystemCommand(&.{ "sh", "-c" });
     // Compose: cd ../dist && for each name, append "<hex>  <name>" to
     // checksums.txt. Truncate first to make the step idempotent.
-    var script = std.ArrayList(u8).init(b.allocator);
-    script.appendSlice("cd ../dist && : > checksums.txt && ") catch @panic("OOM");
+    var script: std.ArrayList(u8) = .empty;
+    script.appendSlice(b.allocator, "cd ../dist && : > checksums.txt && ") catch @panic("OOM");
     for (tar_names.items, 0..) |name, i| {
-        if (i != 0) script.appendSlice(" && ") catch @panic("OOM");
+        if (i != 0) script.appendSlice(b.allocator, " && ") catch @panic("OOM");
         // Prefer sha256sum (Linux coreutils); fall back to shasum (macOS / Perl).
-        script.writer().print("{{ sha256sum '{s}' 2>/dev/null || shasum -a 256 '{s}'; }} | awk '{{print $1\"  \"\"{s}\"}}' >> checksums.txt", .{ name, name, name }) catch @panic("OOM");
+        const line = b.fmt("{{ sha256sum '{s}' 2>/dev/null || shasum -a 256 '{s}'; }} | awk '{{print $1\"  \"{s}\"}}' >> checksums.txt", .{ name, name, name });
+        script.appendSlice(b.allocator, line) catch @panic("OOM");
     }
     checksum_cmd.addArg(script.items);
     for (tar_steps.items) |s| checksum_cmd.step.dependOn(s);

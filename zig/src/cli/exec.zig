@@ -28,49 +28,44 @@ pub fn run(ctx: *root.Context, args: []const []const u8) !u8 {
         return 0;
     }
 
-    var rest = std.ArrayList([]const u8).init(ctx.allocator);
-    defer rest.deinit();
-    const env_opt = try root.popStringFlag(exec_flags, "--env", &rest);
+    var rest: std.ArrayList([]const u8) = .empty;
+    defer rest.deinit(ctx.allocator);
+    const env_opt = try root.popStringFlag(ctx.allocator, exec_flags, "--env", &rest);
     const env = env_opt orelse "dev";
 
     if (rest.items.len != 0) {
-        try ctx.stderr.writer().writeAll("envless: exec: unexpected positional args before --\n");
-        try ctx.stderr.writer().writeAll("Run `envless exec -h` for help.\n");
+        try ctx.errWriteAll("envless: exec: unexpected positional args before --\n");
+        try ctx.errWriteAll("Run `envless exec -h` for help.\n");
         return 2;
     }
     if (child_argv.len == 0) {
-        try ctx.stderr.writer().writeAll("envless: exec: missing command\n");
-        try ctx.stderr.writer().writeAll("Run `envless exec -h` for help.\n");
+        try ctx.errWriteAll("envless: exec: missing command\n");
+        try ctx.errWriteAll("Run `envless exec -h` for help.\n");
         return 2;
     }
 
-    const s = store.Store.init(ctx.allocator, ctx.cwd);
+    const s = store.Store.init(ctx.allocator, ctx.io, ctx.cwd);
     var kv_result = s.read(env) catch |err| {
-        try ctx.stderr.writer().print("envless: exec: {s}\n", .{@errorName(err)});
+        try ctx.errPrint("envless: exec: {s}\n", .{@errorName(err)});
         return 1;
     };
     defer kv_result.deinit();
 
     // Build child env: merge parent env + secrets.
     // Materialize parent env into a []const []const u8 slice.
-    var env_map = std.process.getEnvMap(ctx.allocator) catch return 1;
-    defer env_map.deinit();
-
-    var parent_entries = std.ArrayList([]u8).init(ctx.allocator);
+    // std.process.getEnvMap was removed in 0.16; iterate std.c.environ directly.
+    var parent_entries: std.ArrayList([]u8) = .empty;
     defer {
         for (parent_entries.items) |s2| ctx.allocator.free(s2);
-        parent_entries.deinit();
+        parent_entries.deinit(ctx.allocator);
     }
     {
-        var it = env_map.iterator();
-        while (it.next()) |e| {
-            const k = e.key_ptr.*;
-            const v = e.value_ptr.*;
-            const buf = try ctx.allocator.alloc(u8, k.len + 1 + v.len);
-            @memcpy(buf[0..k.len], k);
-            buf[k.len] = '=';
-            @memcpy(buf[k.len + 1 ..], v);
-            try parent_entries.append(buf);
+        var i: usize = 0;
+        while (std.c.environ[i]) |entry_ptr| : (i += 1) {
+            const entry = std.mem.span(entry_ptr);
+            const buf = try ctx.allocator.alloc(u8, entry.len);
+            @memcpy(buf, entry);
+            try parent_entries.append(ctx.allocator, buf);
         }
     }
     var parent_view = try ctx.allocator.alloc([]const u8, parent_entries.items.len);
@@ -84,13 +79,14 @@ pub fn run(ctx: *root.Context, args: []const []const u8) !u8 {
     // input, write output, etc).
     const res = execenv.run(
         ctx.allocator,
+        ctx.io,
         child_argv,
         child_env,
         ctx.stdin,
         ctx.stdout,
         ctx.stderr,
     ) catch |err| {
-        try ctx.stderr.writer().print("envless: exec: {s}\n", .{@errorName(err)});
+        try ctx.errPrint("envless: exec: {s}\n", .{@errorName(err)});
         return 1;
     };
     return switch (res) {
@@ -100,47 +96,48 @@ pub fn run(ctx: *root.Context, args: []const []const u8) !u8 {
 }
 
 fn printHelp(ctx: *root.Context) !void {
-    const w = ctx.stdout.writer();
-    const s = root.Style.fromFile(ctx.stdout);
+    var w = ctx.stdoutWriter();
+    const s = try root.Style.fromFile(ctx.io, ctx.stdout);
     const b = s.bold();
     const d = s.dim();
     const r = s.reset();
 
-    try w.print("envless exec {s}— run a command with secrets injected{s}\n\n", .{ d, r });
+    try w.interface.print("envless exec {s}— run a command with secrets injected{s}\n\n", .{ d, r });
 
-    try w.print("{s}Usage:{s}\n", .{ b, r });
-    try w.writeAll("  envless exec [--env=NAME] -- CMD [ARGS...]\n\n");
+    try w.interface.print("{s}Usage:{s}\n", .{ b, r });
+    try w.interface.writeAll("  envless exec [--env=NAME] -- CMD [ARGS...]\n\n");
 
-    try w.print("{s}Description:{s}\n", .{ b, r });
-    try w.writeAll("  Decrypts secrets/<env>.env.enc, merges into the parent's environment\n");
-    try w.writeAll("  (overriding any matching parent keys), then execs CMD with that env.\n");
-    try w.writeAll("  Secrets are passed to the child via the env array — never via argv,\n");
-    try w.writeAll("  never via stdout. The child inherits stdin/stdout/stderr; its exit\n");
-    try w.writeAll("  code is propagated as envless's exit code.\n\n");
+    try w.interface.print("{s}Description:{s}\n", .{ b, r });
+    try w.interface.writeAll("  Decrypts secrets/<env>.env.enc, merges into the parent's environment\n");
+    try w.interface.writeAll("  (overriding any matching parent keys), then execs CMD with that env.\n");
+    try w.interface.writeAll("  Secrets are passed to the child via the env array — never via argv,\n");
+    try w.interface.writeAll("  never via stdout. The child inherits stdin/stdout/stderr; its exit\n");
+    try w.interface.writeAll("  code is propagated as envless's exit code.\n\n");
 
-    try w.print("{s}Flags:{s}\n", .{ b, r });
-    try w.writeAll("  --env=NAME      environment to load (default: dev)\n");
-    try w.writeAll("  -h, --help      show this help (only if it appears before `--`)\n\n");
+    try w.interface.print("{s}Flags:{s}\n", .{ b, r });
+    try w.interface.writeAll("  --env=NAME      environment to load (default: dev)\n");
+    try w.interface.writeAll("  -h, --help      show this help (only if it appears before `--`)\n\n");
 
-    try w.print("{s}Examples:{s}\n", .{ b, r });
-    try w.print("  {s}# Run a Node app with secrets injected{s}\n", .{ d, r });
-    try w.writeAll("  envless exec --env=dev -- node server.js\n\n");
-    try w.print("  {s}# One-off curl with secrets in the env{s}\n", .{ d, r });
-    try w.writeAll("  envless exec --env=prod -- sh -c 'curl -H \"Authorization: Bearer $TOKEN\" https://api'\n\n");
-    try w.print("  {s}# Pass extra env to the child by setting it before the call{s}\n", .{ d, r });
-    try w.writeAll("  CUSTOM_FLAG=1 envless exec --env=dev -- ./script.sh\n\n");
+    try w.interface.print("{s}Examples:{s}\n", .{ b, r });
+    try w.interface.print("  {s}# Run a Node app with secrets injected{s}\n", .{ d, r });
+    try w.interface.writeAll("  envless exec --env=dev -- node server.js\n\n");
+    try w.interface.print("  {s}# One-off curl with secrets in the env{s}\n", .{ d, r });
+    try w.interface.writeAll("  envless exec --env=prod -- sh -c 'curl -H \"Authorization: Bearer $TOKEN\" https://api'\n\n");
+    try w.interface.print("  {s}# Pass extra env to the child by setting it before the call{s}\n", .{ d, r });
+    try w.interface.writeAll("  CUSTOM_FLAG=1 envless exec --env=dev -- ./script.sh\n\n");
 
-    try w.print("{s}Exit codes:{s}\n", .{ b, r });
-    try w.writeAll("  0    child process exited 0\n");
-    try w.writeAll("  N    child process exited N (propagated)\n");
-    try w.writeAll("  2    usage error (missing `--`, no command)\n");
-    try w.writeAll("  64   no .envless/ found\n");
-    try w.writeAll("  65   corrupt sops file\n");
-    try w.writeAll("  66   env not found\n");
-    try w.writeAll("  74   exec failure (binary not on PATH, permission denied)\n\n");
+    try w.interface.print("{s}Exit codes:{s}\n", .{ b, r });
+    try w.interface.writeAll("  0    child process exited 0\n");
+    try w.interface.writeAll("  N    child process exited N (propagated)\n");
+    try w.interface.writeAll("  2    usage error (missing `--`, no command)\n");
+    try w.interface.writeAll("  64   no .envless/ found\n");
+    try w.interface.writeAll("  65   corrupt sops file\n");
+    try w.interface.writeAll("  66   env not found\n");
+    try w.interface.writeAll("  74   exec failure (binary not on PATH, permission denied)\n\n");
 
-    try w.print("{s}See also:{s}\n", .{ b, r });
-    try w.writeAll("  envless list      list keys without exposing values\n");
-    try w.writeAll("  envless get       print one secret value\n");
-    try w.writeAll("  Docs:             https://biliboss.github.io/envless/cli/#envless-exec-env-env-cmd-args\n");
+    try w.interface.print("{s}See also:{s}\n", .{ b, r });
+    try w.interface.writeAll("  envless list      list keys without exposing values\n");
+    try w.interface.writeAll("  envless get       print one secret value\n");
+    try w.interface.writeAll("  Docs:             https://biliboss.github.io/envless/cli/#envless-exec-env-env-cmd-args\n");
+    try w.flush();
 }

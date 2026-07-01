@@ -28,11 +28,8 @@ const testing = std.testing;
 ///
 /// Returns an owned slice the caller must free.
 fn resolveBin(allocator: std.mem.Allocator) ![]u8 {
-    if (std.process.getEnvVarOwned(allocator, "BIN")) |bin| {
-        return bin;
-    } else |err| switch (err) {
-        error.EnvironmentVariableNotFound => {},
-        else => return err,
+    if (std.c.getenv("BIN")) |bin_ptr| {
+        return try allocator.dupe(u8, std.mem.span(bin_ptr));
     }
     // Fallback: cwd-relative path. The zig build runs the test from the
     // zig/ subdirectory; the installed binary is at zig-out/bin/envless.
@@ -49,14 +46,15 @@ fn skipIfMissing(comptime bins: []const []const u8) !void {
 }
 
 fn lookPath(allocator: std.mem.Allocator, bin: []const u8) !bool {
-    const path_env = std.process.getEnvVarOwned(allocator, "PATH") catch return false;
-    defer allocator.free(path_env);
+    const path_ptr = std.c.getenv("PATH") orelse return false;
+    const path_env = std.mem.span(path_ptr);
+    _ = allocator;
     var it = std.mem.splitScalar(u8, path_env, ':');
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
-        const full = try std.fs.path.join(allocator, &.{ dir, bin });
-        defer allocator.free(full);
-        std.fs.accessAbsolute(full, .{}) catch continue;
+        const full = try std.fs.path.join(std.testing.allocator, &.{ dir, bin });
+        defer std.testing.allocator.free(full);
+        std.Io.Dir.cwd().access(std.testing.io, full, .{}) catch continue;
         return true;
     }
     return false;
@@ -85,46 +83,59 @@ fn runEnvless(
     stdin_text: ?[]const u8,
     args: []const []const u8,
 ) !RunOut {
-    var argv = std.ArrayList([]const u8).init(allocator);
-    defer argv.deinit();
-    try argv.append(bin);
-    try argv.appendSlice(args);
+    const io = std.testing.io;
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, bin);
+    try argv.appendSlice(allocator, args);
 
-    var child = std.process.Child.init(argv.items, allocator);
-    if (dir) |d| if (d.len != 0) {
-        child.cwd = d;
-    };
-    child.stdin_behavior = if (stdin_text != null) .Pipe else .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
+    var child = try std.process.spawn(io, .{
+        .argv = argv.items,
+        .cwd = if (dir) |d| if (d.len != 0) .{ .path = d } else .inherit else .inherit,
+        .stdin = if (stdin_text != null) .pipe else .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
 
     if (stdin_text) |s| {
-        if (child.stdin) |stdin| {
-            stdin.writeAll(s) catch {};
-            stdin.close();
+        if (child.stdin) |stdin_file| {
+            var w_buf: [4096]u8 = undefined;
+            var sw = stdin_file.writer(io, &w_buf);
+            sw.interface.writeAll(s) catch {};
+            sw.flush() catch {};
+            stdin_file.close(io);
             child.stdin = null;
         }
     }
 
-    // Drain stdout/stderr concurrently via the harness in std.process.Child.
-    var stdout_buf = std.ArrayList(u8).init(allocator);
-    errdefer stdout_buf.deinit();
-    var stderr_buf = std.ArrayList(u8).init(allocator);
-    errdefer stderr_buf.deinit();
+    // Drain stdout and stderr concurrently to avoid deadlock when the child
+    // writes more than the pipe buffer size to one stream before the other.
+    const stdout_file = child.stdout orelse return error.NoStdout;
+    const stderr_file = child.stderr orelse return error.NoStderr;
 
-    try child.collectOutput(&stdout_buf, &stderr_buf, 4 * 1024 * 1024);
+    var mr_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var mr: std.Io.File.MultiReader = undefined;
+    mr.init(allocator, io, mr_buffer.toStreams(), &.{ stdout_file, stderr_file });
+    defer mr.deinit();
 
-    const term = try child.wait();
+    while (mr.fill(64, .none)) |_| {
+        if (mr.reader(0).buffered().len > 4 * 1024 * 1024) return error.StdoutTooLarge;
+        if (mr.reader(1).buffered().len > 4 * 1024 * 1024) return error.StderrTooLarge;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    }
+    try mr.checkAnyError();
+
+    const term = try child.wait(io);
     const code: u8 = switch (term) {
-        .Exited => |c| @intCast(c),
+        .exited => |c| @intCast(c),
         else => return error.UnexpectedTermination,
     };
 
     return RunOut{
-        .stdout = try stdout_buf.toOwnedSlice(),
-        .stderr = try stderr_buf.toOwnedSlice(),
+        .stdout = try mr.toOwnedSlice(0),
+        .stderr = try mr.toOwnedSlice(1),
         .code = code,
     };
 }
@@ -162,21 +173,19 @@ fn argsToStr(args: []const []const u8) []const u8 {
 /// Make a temporary directory under the OS tmp dir, prefixed `envless-e2e-`,
 /// and return its absolute path (owned).
 fn makeTmpDir(allocator: std.mem.Allocator) ![]u8 {
-    // Use std.testing.tmpDir for cleanup but then realpath it to absolute,
-    // because envless's child process spawn needs an absolute cwd.
-    const tmp_root = std.posix.getenv("TMPDIR") orelse "/tmp";
+    const io = std.testing.io;
+    const tmp_root = if (std.c.getenv("TMPDIR")) |p| std.mem.span(p) else "/tmp";
     // Append a random suffix for uniqueness.
-    var seed: u64 = @intCast(std.time.nanoTimestamp() & 0x7fff_ffff_ffff_ffff);
-    seed +%= @intFromPtr(&seed);
-    var prng = std.Random.DefaultPrng.init(seed);
-    const rnd = prng.random().int(u64);
+    var seed_buf: [8]u8 = undefined;
+    std.Io.randomSecure(io, &seed_buf) catch {};
+    const rnd = std.mem.readInt(u64, &seed_buf, .little);
     const dir = try std.fmt.allocPrint(allocator, "{s}/envless-e2e-{x}", .{ tmp_root, rnd });
-    try std.fs.makeDirAbsolute(dir);
+    try std.Io.Dir.createDirAbsolute(io, dir, .default_dir);
     return dir;
 }
 
 fn rmTreeAbs(path: []const u8) void {
-    std.fs.deleteTreeAbsolute(path) catch {};
+    std.Io.Dir.cwd().deleteTree(std.testing.io, path) catch {};
 }
 
 fn trim(s: []const u8) []const u8 {
@@ -220,7 +229,7 @@ test "TestE2E_InitSetExecRoundtrip" {
     {
         const id = try std.fs.path.join(a, &.{ dir, ".envless", "identity.key" });
         defer a.free(id);
-        std.fs.accessAbsolute(id, .{}) catch |err| {
+        std.Io.Dir.cwd().access(std.testing.io, id, .{}) catch |err| {
             std.debug.print("identity not created: {s}\n", .{@errorName(err)});
             return error.TestUnexpectedIdentityMissing;
         };
@@ -375,9 +384,12 @@ test "TestE2E_Migrate" {
     {
         const dotenv = try std.fs.path.join(a, &.{ dir, ".env" });
         defer a.free(dotenv);
-        const f = try std.fs.createFileAbsolute(dotenv, .{});
-        defer f.close();
-        try f.writeAll("A=1\nB=2\nURL=https://x.com?a=b\n");
+        const f = try std.Io.Dir.createFileAbsolute(std.testing.io, dotenv, .{});
+        defer f.close(std.testing.io);
+        var w_buf: [4096]u8 = undefined;
+        var fw = f.writer(std.testing.io, &w_buf);
+        try fw.interface.writeAll("A=1\nB=2\nURL=https://x.com?a=b\n");
+        try fw.flush();
     }
 
     {
@@ -402,7 +414,7 @@ test "TestE2E_Migrate" {
     {
         const gi_path = try std.fs.path.join(a, &.{ dir, ".gitignore" });
         defer a.free(gi_path);
-        const data = try std.fs.cwd().readFileAlloc(a, gi_path, 64 * 1024);
+        const data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, gi_path, a, .limited(64 * 1024));
         defer a.free(data);
         if (std.mem.indexOf(u8, data, ".env") == null) {
             std.debug.print(".env not in .gitignore:\n{s}\n", .{data});
@@ -492,35 +504,56 @@ fn runMcpScript(
     dir: ?[]const u8,
     script: []const u8,
 ) !RunOut {
-    var child = std.process.Child.init(&.{ bin, "mcp" }, allocator);
-    if (dir) |d| if (d.len != 0) {
-        child.cwd = d;
-    };
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
+    const io = std.testing.io;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ bin, "mcp" },
+        .cwd = if (dir) |d| if (d.len != 0) .{ .path = d } else .inherit else .inherit,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
 
-    if (child.stdin) |stdin| {
-        try stdin.writeAll(script);
-        stdin.close();
+    if (child.stdin) |stdin_file| {
+        var w_buf: [4096]u8 = undefined;
+        var sw = stdin_file.writer(io, &w_buf);
+        sw.interface.writeAll(script) catch {};
+        sw.flush() catch {};
+        stdin_file.close(io);
         child.stdin = null;
     }
 
-    var stdout_buf = std.ArrayList(u8).init(allocator);
-    errdefer stdout_buf.deinit();
-    var stderr_buf = std.ArrayList(u8).init(allocator);
-    errdefer stderr_buf.deinit();
-    try child.collectOutput(&stdout_buf, &stderr_buf, 4 * 1024 * 1024);
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    errdefer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    errdefer stderr_buf.deinit(allocator);
 
-    const term = try child.wait();
+    if (child.stdout) |so| {
+        var r_buf: [4096]u8 = undefined;
+        var sr = so.reader(io, &r_buf);
+        while (true) {
+            const n = sr.interface.readSliceShort(&r_buf) catch break;
+            if (n == 0) break;
+            try stdout_buf.appendSlice(allocator, r_buf[0..n]);
+        }
+    }
+    if (child.stderr) |se| {
+        var r_buf: [4096]u8 = undefined;
+        var sr = se.reader(io, &r_buf);
+        while (true) {
+            const n = sr.interface.readSliceShort(&r_buf) catch break;
+            if (n == 0) break;
+            try stderr_buf.appendSlice(allocator, r_buf[0..n]);
+        }
+    }
+
+    const term = try child.wait(io);
     const code: u8 = switch (term) {
-        .Exited => |c| @intCast(c),
+        .exited => |c| @intCast(c),
         else => return error.UnexpectedTermination,
     };
     return RunOut{
-        .stdout = try stdout_buf.toOwnedSlice(),
-        .stderr = try stderr_buf.toOwnedSlice(),
+        .stdout = try stdout_buf.toOwnedSlice(allocator),
+        .stderr = try stderr_buf.toOwnedSlice(allocator),
         .code = code,
     };
 }
@@ -676,24 +709,37 @@ test "TestE2E_DaemonPingAndList" {
     // a developer's daemon. Note: the spawned daemon inherits this.
     const xdg = try std.fs.path.join(a, &.{ dir, ".xdg-rt" });
     defer a.free(xdg);
-    try std.fs.makeDirAbsolute(xdg);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, xdg, .default_dir);
 
     // Spawn the daemon in the background with HOME=dir, XDG_RUNTIME_DIR=xdg.
-    var child = std.process.Child.init(&.{ bin, "daemon" }, a);
-    child.cwd = dir;
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    var env_map = try std.process.getEnvMap(a);
+    const io = std.testing.io;
+    var env_map = std.process.Environ.Map.init(a);
     defer env_map.deinit();
+    // Copy parent env.
+    {
+        var i: usize = 0;
+        while (std.c.environ[i]) |entry_ptr| : (i += 1) {
+            const entry = std.mem.span(entry_ptr);
+            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+            try env_map.put(entry[0..eq], entry[eq + 1 ..]);
+        }
+    }
     try env_map.put("HOME", dir);
     try env_map.put("XDG_RUNTIME_DIR", xdg);
-    child.env_map = &env_map;
-    try child.spawn();
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ bin, "daemon" },
+        .cwd = .{ .path = dir },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .environ_map = &env_map,
+    });
     defer {
         // Best-effort teardown.
-        _ = std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
-        _ = child.wait() catch {};
+        if (child.id) |pid| {
+            _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+        }
+        _ = child.wait(io) catch {};
     }
 
     // Wait up to 2s for the socket to appear, then probe it with PING.
@@ -702,8 +748,8 @@ test "TestE2E_DaemonPingAndList" {
 
     var attempts: usize = 0;
     while (attempts < 200) : (attempts += 1) {
-        std.fs.accessAbsolute(sock_path, .{}) catch {
-            std.time.sleep(10 * std.time.ns_per_ms);
+        std.Io.Dir.cwd().access(io, sock_path, .{}) catch {
+            std.Io.sleep(io, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
             continue;
         };
         break;
@@ -714,24 +760,32 @@ test "TestE2E_DaemonPingAndList" {
 
     // PING
     {
-        var stream = try std.net.connectUnixSocket(sock_path);
-        defer stream.close();
-        try stream.writer().writeAll("PING\n");
-        var buf: [128]u8 = undefined;
-        const n = try stream.reader().read(&buf);
-        if (!std.mem.startsWith(u8, buf[0..n], "OK\t")) {
-            std.debug.print("ping reply unexpected: {s}\n", .{buf[0..n]});
+        var addr = try std.Io.net.UnixAddress.init(sock_path);
+        var stream = try addr.connect(io);
+        defer stream.close(io);
+        var w_buf: [64]u8 = undefined;
+        var w = stream.writer(io, &w_buf);
+        try w.interface.writeAll("PING\n");
+        var r_buf: [128]u8 = undefined;
+        var sr = stream.reader(io, &r_buf);
+        const n = try sr.interface.readSliceShort(&r_buf);
+        if (!std.mem.startsWith(u8, r_buf[0..n], "OK\t")) {
+            std.debug.print("ping reply unexpected: {s}\n", .{r_buf[0..n]});
             return error.PingFailed;
         }
     }
     // LIST dev
     {
-        var stream = try std.net.connectUnixSocket(sock_path);
-        defer stream.close();
-        try stream.writer().writeAll("LIST\tdev\n");
-        var buf: [4096]u8 = undefined;
-        const n = try stream.reader().read(&buf);
-        const line = buf[0..n];
+        var addr = try std.Io.net.UnixAddress.init(sock_path);
+        var stream = try addr.connect(io);
+        defer stream.close(io);
+        var w_buf: [64]u8 = undefined;
+        var w = stream.writer(io, &w_buf);
+        try w.interface.writeAll("LIST\tdev\n");
+        var r_buf: [4096]u8 = undefined;
+        var sr = stream.reader(io, &r_buf);
+        const n = try sr.interface.readSliceShort(&r_buf);
+        const line = r_buf[0..n];
         if (std.mem.indexOf(u8, line, "\"keys\":[\"TOKEN\"]") == null) {
             std.debug.print("LIST reply unexpected: {s}\n", .{line});
             return error.ListFailed;
@@ -745,34 +799,50 @@ test "TestE2E_DaemonPingAndList" {
 
 /// Capture `tar -tzf <path>` member list as one big string. Caller owns.
 fn tarMembers(allocator: std.mem.Allocator, tar_path: []const u8) ![]u8 {
-    var child = std.process.Child.init(&.{ "tar", "-tzf", tar_path }, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
-    var out_buf = std.ArrayList(u8).init(allocator);
-    errdefer out_buf.deinit();
-    var err_buf = std.ArrayList(u8).init(allocator);
-    defer err_buf.deinit();
-    try child.collectOutput(&out_buf, &err_buf, 4 * 1024 * 1024);
-    _ = try child.wait();
-    return out_buf.toOwnedSlice();
+    const io = std.testing.io;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "tar", "-tzf", tar_path },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    var out_buf: std.ArrayList(u8) = .empty;
+    errdefer out_buf.deinit(allocator);
+    if (child.stdout) |so| {
+        var r_buf: [4096]u8 = undefined;
+        var sr = so.reader(io, &r_buf);
+        while (true) {
+            const n = sr.interface.readSliceShort(&r_buf) catch break;
+            if (n == 0) break;
+            try out_buf.appendSlice(allocator, r_buf[0..n]);
+        }
+    }
+    _ = try child.wait(io);
+    return out_buf.toOwnedSlice(allocator);
 }
 
 /// Read a single member's contents from a tarball, into memory. Returns owned.
 fn tarReadMember(allocator: std.mem.Allocator, tar_path: []const u8, member: []const u8) ![]u8 {
-    var child = std.process.Child.init(&.{ "tar", "-xzOf", tar_path, member }, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
-    var out_buf = std.ArrayList(u8).init(allocator);
-    errdefer out_buf.deinit();
-    var err_buf = std.ArrayList(u8).init(allocator);
-    defer err_buf.deinit();
-    try child.collectOutput(&out_buf, &err_buf, 4 * 1024 * 1024);
-    _ = try child.wait();
-    return out_buf.toOwnedSlice();
+    const io = std.testing.io;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "tar", "-xzOf", tar_path, member },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    var out_buf: std.ArrayList(u8) = .empty;
+    errdefer out_buf.deinit(allocator);
+    if (child.stdout) |so| {
+        var r_buf: [4096]u8 = undefined;
+        var sr = so.reader(io, &r_buf);
+        while (true) {
+            const n = sr.interface.readSliceShort(&r_buf) catch break;
+            if (n == 0) break;
+            try out_buf.appendSlice(allocator, r_buf[0..n]);
+        }
+    }
+    _ = try child.wait(io);
+    return out_buf.toOwnedSlice(allocator);
 }
 
 test "backup: default excludes identity.key" {

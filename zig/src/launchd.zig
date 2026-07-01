@@ -23,7 +23,7 @@ const std = @import("std");
 
 // Cross-target libc decl. `std.posix.getuid` is not exposed for the macOS
 // cross-compile in Zig 0.13's stdlib slice, so we bind libc directly.
-extern fn getuid() callconv(.C) std.posix.uid_t;
+extern fn getuid() callconv(.c) std.posix.uid_t;
 
 pub const DEFAULT_LABEL = "io.github.biliboss.envless";
 pub const LABEL_ENV = "ENVLESS_LAUNCHD_LABEL";
@@ -64,25 +64,25 @@ fn computePaths(a: std.mem.Allocator, home: []const u8, label: []const u8) !Path
     };
 }
 
-fn resolveExePath(a: std.mem.Allocator) ![]u8 {
-    var buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-    const slice = try std.fs.selfExePath(&buf);
-    return a.dupe(u8, slice);
+fn resolveExePath(a: std.mem.Allocator, io: std.Io) ![]u8 {
+    var buf: [4096]u8 = undefined;
+    const len = try std.process.executablePath(io, &buf);
+    return a.dupe(u8, buf[0..len]);
 }
 
 fn xmlEscape(a: std.mem.Allocator, s: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).init(a);
-    defer out.deinit();
-    try out.ensureTotalCapacity(s.len);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try out.ensureTotalCapacity(a, s.len);
     for (s) |c| switch (c) {
-        '&' => try out.appendSlice("&amp;"),
-        '<' => try out.appendSlice("&lt;"),
-        '>' => try out.appendSlice("&gt;"),
-        '"' => try out.appendSlice("&quot;"),
-        '\'' => try out.appendSlice("&apos;"),
-        else => try out.append(c),
+        '&' => try out.appendSlice(a, "&amp;"),
+        '<' => try out.appendSlice(a, "&lt;"),
+        '>' => try out.appendSlice(a, "&gt;"),
+        '"' => try out.appendSlice(a, "&quot;"),
+        '\'' => try out.appendSlice(a, "&apos;"),
+        else => try out.append(a, c),
     };
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(a);
 }
 
 pub fn renderPlist(
@@ -145,30 +145,34 @@ pub fn renderPlist(
     , .{ label_e, exe_e, stdout_e, stderr_e, cache_e, home_e });
 }
 
-fn writePlistAtomic(a: std.mem.Allocator, paths: Paths, contents: []const u8) !void {
-    std.fs.cwd().makePath(paths.plist_dir) catch {};
+fn writePlistAtomic(a: std.mem.Allocator, io: std.Io, paths: Paths, contents: []const u8) !void {
+    std.Io.Dir.cwd().createDirPath(io, paths.plist_dir) catch {};
     const tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{paths.plist_abs});
     defer a.free(tmp);
     {
-        var f = try std.fs.cwd().createFile(tmp, .{ .truncate = true, .mode = 0o644 });
-        defer f.close();
-        try f.writeAll(contents);
+        var f = try std.Io.Dir.cwd().createFile(io, tmp, .{ .truncate = true });
+        defer f.close(io);
+        var write_buf: [4096]u8 = undefined;
+        var fw = f.writer(io, &write_buf);
+        try fw.interface.writeAll(contents);
+        try fw.flush();
     }
-    try std.fs.cwd().rename(tmp, paths.plist_abs);
+    try std.Io.Dir.renameAbsolute(tmp, paths.plist_abs, io);
 }
 
-fn plistExists(paths: Paths) bool {
-    std.fs.cwd().access(paths.plist_abs, .{}) catch return false;
+fn plistExists(io: std.Io, paths: Paths) bool {
+    std.Io.Dir.cwd().access(io, paths.plist_abs, .{}) catch return false;
     return true;
 }
 
-fn runLaunchctl(a: std.mem.Allocator, argv: []const []const u8) !std.process.Child.RunResult {
-    return std.process.Child.run(.{ .allocator = a, .argv = argv });
+fn runLaunchctl(a: std.mem.Allocator, io: std.Io, argv: []const []const u8) !std.process.RunResult {
+    return std.process.run(a, io, .{ .argv = argv });
 }
 
 pub fn install(
     a: std.mem.Allocator,
-    writer: anytype,
+    io: std.Io,
+    writer: *std.Io.File.Writer,
     home: []const u8,
     label_override: ?[]const u8,
     exe_path_override: ?[]const u8,
@@ -176,102 +180,104 @@ pub fn install(
     const label = pickLabel(label_override);
     const paths = try computePaths(a, home, label);
 
-    if (plistExists(paths)) {
-        try writer.print("[launchd] already installed at {s} — uninstall first\n", .{paths.plist_abs});
+    if (plistExists(io, paths)) {
+        try writer.interface.print("[launchd] already installed at {s} — uninstall first\n", .{paths.plist_abs});
         return error.AlreadyInstalled;
     }
 
-    const exe_path = exe_path_override orelse try resolveExePath(a);
+    const exe_path = exe_path_override orelse try resolveExePath(a, io);
 
-    std.fs.cwd().makePath(paths.cache_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, paths.cache_dir) catch {};
 
     const xml = try renderPlist(a, label, exe_path, home, paths.cache_dir, paths.stdout_log, paths.stderr_log);
     defer a.free(xml);
 
-    try writePlistAtomic(a, paths, xml);
-    try writer.print("[launchd] wrote {s} ({d} bytes)\n", .{ paths.plist_abs, xml.len });
+    try writePlistAtomic(a, io, paths, xml);
+    try writer.interface.print("[launchd] wrote {s} ({d} bytes)\n", .{ paths.plist_abs, xml.len });
 
     const domain = try std.fmt.allocPrint(a, "gui/{d}", .{paths.uid});
     defer a.free(domain);
     const argv = [_][]const u8{ "/bin/launchctl", "bootstrap", domain, paths.plist_abs };
 
-    const r = runLaunchctl(a, &argv) catch |err| {
-        try writer.print("[launchd] launchctl spawn failed: {s}\n", .{@errorName(err)});
+    const r = runLaunchctl(a, io, &argv) catch |err| {
+        try writer.interface.print("[launchd] launchctl spawn failed: {s}\n", .{@errorName(err)});
         return err;
     };
     defer a.free(r.stdout);
     defer a.free(r.stderr);
     switch (r.term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code == 0) {
-                try writer.print("[launchd] bootstrap OK (domain={s} label={s})\n", .{ domain, label });
+                try writer.interface.print("[launchd] bootstrap OK (domain={s} label={s})\n", .{ domain, label });
                 return;
             }
-            try writer.print("[launchd] bootstrap exit={d}\nstdout: {s}\nstderr: {s}\n", .{ code, r.stdout, r.stderr });
+            try writer.interface.print("[launchd] bootstrap exit={d}\nstdout: {s}\nstderr: {s}\n", .{ code, r.stdout, r.stderr });
             return error.BootstrapFailed;
         },
         else => {
-            try writer.print("[launchd] bootstrap abnormal term\n", .{});
+            try writer.interface.print("[launchd] bootstrap abnormal term\n", .{});
             return error.BootstrapFailed;
         },
     }
 }
 
-pub fn uninstall(a: std.mem.Allocator, writer: anytype, home: []const u8, label_override: ?[]const u8) !void {
+pub fn uninstall(a: std.mem.Allocator, io: std.Io,
+    writer: *std.Io.File.Writer, home: []const u8, label_override: ?[]const u8) !void {
     const label = pickLabel(label_override);
     const paths = try computePaths(a, home, label);
-    if (!plistExists(paths)) {
-        try writer.print("[launchd] not installed (no plist at {s})\n", .{paths.plist_abs});
+    if (!plistExists(io, paths)) {
+        try writer.interface.print("[launchd] not installed (no plist at {s})\n", .{paths.plist_abs});
         return error.NotInstalled;
     }
     const domain = try std.fmt.allocPrint(a, "gui/{d}", .{paths.uid});
     defer a.free(domain);
     const argv = [_][]const u8{ "/bin/launchctl", "bootout", domain, paths.plist_abs };
-    if (runLaunchctl(a, &argv)) |r| {
+    if (runLaunchctl(a, io, &argv)) |r| {
         defer a.free(r.stdout);
         defer a.free(r.stderr);
         switch (r.term) {
-            .Exited => |code| if (code != 0) {
-                try writer.print("[launchd] bootout warn code={d}\nstdout: {s}\nstderr: {s}\n", .{ code, r.stdout, r.stderr });
+            .exited => |code| if (code != 0) {
+                try writer.interface.print("[launchd] bootout warn code={d}\nstdout: {s}\nstderr: {s}\n", .{ code, r.stdout, r.stderr });
             } else {
-                try writer.print("[launchd] bootout OK\n", .{});
+                try writer.interface.print("[launchd] bootout OK\n", .{});
             },
-            else => try writer.print("[launchd] bootout abnormal\n", .{}),
+            else => try writer.interface.print("[launchd] bootout abnormal\n", .{}),
         }
     } else |err| {
-        try writer.print("[launchd] bootout spawn failed: {s} (continuing)\n", .{@errorName(err)});
+        try writer.interface.print("[launchd] bootout spawn failed: {s} (continuing)\n", .{@errorName(err)});
     }
-    std.fs.cwd().deleteFile(paths.plist_abs) catch |err| {
-        try writer.print("[launchd] could not delete plist: {s}\n", .{@errorName(err)});
+    std.Io.Dir.cwd().deleteFile(io, paths.plist_abs) catch |err| {
+        try writer.interface.print("[launchd] could not delete plist: {s}\n", .{@errorName(err)});
         return err;
     };
-    try writer.print("[launchd] removed {s}\n", .{paths.plist_abs});
+    try writer.interface.print("[launchd] removed {s}\n", .{paths.plist_abs});
 }
 
-pub fn status(a: std.mem.Allocator, writer: anytype, home: []const u8, label_override: ?[]const u8) !void {
+pub fn status(a: std.mem.Allocator, io: std.Io,
+    writer: *std.Io.File.Writer, home: []const u8, label_override: ?[]const u8) !void {
     const label = pickLabel(label_override);
     const paths = try computePaths(a, home, label);
-    const present = plistExists(paths);
-    try writer.print("[launchd] plist: {s} ({s})\n", .{ paths.plist_abs, if (present) "present" else "missing" });
-    try writer.print("[launchd] label: {s}\n", .{label});
-    try writer.print("[launchd] uid:   {d}\n", .{paths.uid});
+    const present = plistExists(io, paths);
+    try writer.interface.print("[launchd] plist: {s} ({s})\n", .{ paths.plist_abs, if (present) "present" else "missing" });
+    try writer.interface.print("[launchd] label: {s}\n", .{label});
+    try writer.interface.print("[launchd] uid:   {d}\n", .{paths.uid});
 
     const service_target = try std.fmt.allocPrint(a, "gui/{d}/{s}", .{ paths.uid, label });
     defer a.free(service_target);
     const argv = [_][]const u8{ "/bin/launchctl", "print", service_target };
-    if (runLaunchctl(a, &argv)) |r| {
+    if (runLaunchctl(a, io, &argv)) |r| {
         defer a.free(r.stdout);
         defer a.free(r.stderr);
         switch (r.term) {
-            .Exited => |code| if (code == 0) {
-                try writer.print("[launchd] print OK\n--- begin ---\n{s}--- end ---\n", .{r.stdout});
+            .exited => |code| if (code == 0) {
+                try writer.interface.print("[launchd] print OK\n--- begin ---\n{s}--- end ---\n", .{r.stdout});
             } else {
-                try writer.print("[launchd] print code={d} (not loaded?)\nstderr: {s}\n", .{ code, r.stderr });
+                try writer.interface.print("[launchd] print code={d} (not loaded?)\nstderr: {s}\n", .{ code, r.stderr });
             },
-            else => try writer.print("[launchd] print abnormal\n", .{}),
+            else => try writer.interface.print("[launchd] print abnormal\n", .{}),
         }
     } else |err| {
-        try writer.print("[launchd] print spawn failed: {s}\n", .{@errorName(err)});
+        try writer.interface.print("[launchd] print spawn failed: {s}\n", .{@errorName(err)});
     }
 }
 
@@ -279,8 +285,10 @@ pub fn status(a: std.mem.Allocator, writer: anytype, home: []const u8, label_ove
 /// socket and connecting (the daemon doesn't expose a STOP op — the signal
 /// handler is the supported shutdown path). We fall back to the supervisor's
 /// stop path when available.
-pub fn stopRunning(a: std.mem.Allocator, writer: anytype, home: []const u8) !void {
+pub fn stopRunning(a: std.mem.Allocator, io: std.Io,
+    writer: *std.Io.File.Writer, home: []const u8) !void {
     _ = a;
+    _ = io;
     _ = writer;
     _ = home;
     // Best path on macOS: launchctl kill TERM gui/<uid>/<label>.

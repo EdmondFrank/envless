@@ -58,6 +58,7 @@ pub fn renderDotenv(allocator: std.mem.Allocator, kv: std.StringHashMap([]const 
 
 /// Encrypt kv into a sops dotenv file at dst, using the given age recipients.
 pub fn encrypt(
+    io: std.Io,
     allocator: std.mem.Allocator,
     dst: []const u8,
     kv: std.StringHashMap([]const u8),
@@ -67,7 +68,7 @@ pub fn encrypt(
 
     // mkdir -p (dirname dst)
     if (std.fs.path.dirname(dst)) |dir| {
-        std.fs.cwd().makePath(dir) catch return Error.MkdirFailed;
+        std.Io.Dir.cwd().createDirPath(io, dir) catch return Error.MkdirFailed;
     }
 
     const plain = try renderDotenv(allocator, kv);
@@ -75,22 +76,25 @@ pub fn encrypt(
 
     // Create a temp file in the same directory as dst (matches Go behavior).
     const dst_dir_path = std.fs.path.dirname(dst) orelse ".";
-    var dst_dir = std.fs.cwd().openDir(dst_dir_path, .{}) catch return Error.TempFileFailed;
-    defer dst_dir.close();
+    var dst_dir = std.Io.Dir.cwd().openDir(io, dst_dir_path, .{}) catch return Error.TempFileFailed;
+    defer dst_dir.close(io);
 
     // Generate a temp name. Go uses os.CreateTemp(dir, ".envless-enc-*.env").
     var rand_buf: [16]u8 = undefined;
-    std.crypto.random.bytes(&rand_buf);
+    std.Io.randomSecure(io, &rand_buf) catch return Error.TempFileFailed;
     var name_buf: [64]u8 = undefined;
-    const tmp_name = std.fmt.bufPrint(&name_buf, ".envless-enc-{}.env", .{std.fmt.fmtSliceHexLower(&rand_buf)}) catch return Error.TempFileFailed;
+    const tmp_name = std.fmt.bufPrint(&name_buf, ".envless-enc-{x}.env", .{rand_buf}) catch return Error.TempFileFailed;
 
     {
-        var tmp_file = dst_dir.createFile(tmp_name, .{ .truncate = true, .mode = 0o600 }) catch return Error.TempFileFailed;
-        defer tmp_file.close();
-        tmp_file.writeAll(plain) catch return Error.WriteFailed;
+        var tmp_file = dst_dir.createFile(io, tmp_name, .{ .truncate = true }) catch return Error.TempFileFailed;
+        defer tmp_file.close(io);
+        var tmp_w_buf: [4096]u8 = undefined;
+        var tw = tmp_file.writer(io, &tmp_w_buf);
+        tw.interface.writeAll(plain) catch return Error.WriteFailed;
+        tw.flush() catch return Error.WriteFailed;
     }
     // Ensure temp file is removed even on failure.
-    defer dst_dir.deleteFile(tmp_name) catch {};
+    defer dst_dir.deleteFile(io, tmp_name) catch {};
 
     const tmp_full = std.fs.path.join(allocator, &.{ dst_dir_path, tmp_name }) catch return Error.OutOfMemory;
     defer allocator.free(tmp_full);
@@ -122,29 +126,24 @@ pub fn encrypt(
         tmp_full,
     };
 
-    var child = std.process.Child.init(&argv, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    child.spawn() catch return Error.SopsEncryptFailed;
-
-    // Drain stdout/stderr.
-    var stdout_buf = std.ArrayList(u8).init(allocator);
-    defer stdout_buf.deinit();
-    var stderr_buf = std.ArrayList(u8).init(allocator);
-    defer stderr_buf.deinit();
-
-    child.collectOutput(&stdout_buf, &stderr_buf, 64 * 1024 * 1024) catch return Error.SopsEncryptFailed;
-    const term = child.wait() catch return Error.SopsEncryptFailed;
-    switch (term) {
-        .Exited => |code| if (code != 0) return Error.SopsEncryptFailed,
+    const r = std.process.run(allocator, io, .{
+        .argv = &argv,
+        .stdout_limit = .limited(64 * 1024 * 1024),
+    }) catch return Error.SopsEncryptFailed;
+    defer allocator.free(r.stdout);
+    defer allocator.free(r.stderr);
+    switch (r.term) {
+        .exited => |code| if (code != 0) return Error.SopsEncryptFailed,
         else => return Error.SopsEncryptFailed,
     }
 
-    // Write captured stdout to dst with mode 0o644.
-    var out_file = std.fs.cwd().createFile(dst, .{ .truncate = true, .mode = 0o644 }) catch return Error.WriteFailed;
-    defer out_file.close();
-    out_file.writeAll(stdout_buf.items) catch return Error.WriteFailed;
+    // Write captured stdout to dst.
+    var out_file = std.Io.Dir.cwd().createFile(io, dst, .{ .truncate = true }) catch return Error.WriteFailed;
+    defer out_file.close(io);
+    var out_w_buf: [4096]u8 = undefined;
+    var ow = out_file.writer(io, &out_w_buf);
+    ow.interface.writeAll(r.stdout) catch return Error.WriteFailed;
+    ow.flush() catch return Error.WriteFailed;
 }
 
 /// Decrypted KV map. Caller owns: free each key/value and the map itself.
@@ -165,6 +164,7 @@ pub const KvMap = struct {
 /// Decrypt a sops-encrypted dotenv file. identity_file may be empty to skip
 /// setting SOPS_AGE_KEY_FILE (matches Go behavior when identityFile == "").
 pub fn decrypt(
+    io: std.Io,
     allocator: std.mem.Allocator,
     src: []const u8,
     identity_file: []const u8,
@@ -177,34 +177,36 @@ pub fn decrypt(
         src,
     };
 
-    var child = std.process.Child.init(&argv, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    // Build env: parent + SOPS_AGE_KEY_FILE if non-empty.
-    var env_map = std.process.getEnvMap(allocator) catch return Error.OutOfMemory;
-    defer env_map.deinit();
+    // Build env: parent + SOPS_AGE_KEY_FILE if identity_file is set.
+    // We use environ_map to pass the env var directly to the child process,
+    // avoiding shell injection via sh -c (security: this is a secrets manager).
+    var env_map: ?std.process.Environ.Map = null;
+    defer if (env_map != null) env_map.?.deinit();
     if (identity_file.len != 0) {
-        env_map.put("SOPS_AGE_KEY_FILE", identity_file) catch return Error.OutOfMemory;
+        env_map = std.process.Environ.Map.init(allocator);
+        var i: usize = 0;
+        while (std.c.environ[i]) |entry_ptr| : (i += 1) {
+            const e = std.mem.span(entry_ptr);
+            const eq = std.mem.indexOfScalar(u8, e, '=') orelse continue;
+            env_map.?.put(e[0..eq], e[eq + 1 ..]) catch return Error.OutOfMemory;
+        }
+        env_map.?.put("SOPS_AGE_KEY_FILE", identity_file) catch return Error.OutOfMemory;
     }
-    child.env_map = &env_map;
 
-    child.spawn() catch return Error.SopsDecryptFailed;
-
-    var stdout_buf = std.ArrayList(u8).init(allocator);
-    defer stdout_buf.deinit();
-    var stderr_buf = std.ArrayList(u8).init(allocator);
-    defer stderr_buf.deinit();
-
-    child.collectOutput(&stdout_buf, &stderr_buf, 64 * 1024 * 1024) catch return Error.SopsDecryptFailed;
-    const term = child.wait() catch return Error.SopsDecryptFailed;
-    switch (term) {
-        .Exited => |code| if (code != 0) return Error.SopsDecryptFailed,
+    const r = std.process.run(allocator, io, .{
+        .argv = &argv,
+        .stdout_limit = .limited(64 * 1024 * 1024),
+        .environ_map = if (env_map != null) &env_map.? else null,
+    }) catch return Error.SopsDecryptFailed;
+    defer allocator.free(r.stdout);
+    defer allocator.free(r.stderr);
+    switch (r.term) {
+        .exited => |code| if (code != 0) return Error.SopsDecryptFailed,
         else => return Error.SopsDecryptFailed,
     }
 
     // Parse the decrypted dotenv output.
-    const entries = envparse.parse(allocator, stdout_buf.items) catch return Error.OutOfMemory;
+    const entries = envparse.parse(allocator, r.stdout) catch return Error.OutOfMemory;
     defer allocator.free(entries);
     // entries' key/value slices are heap-owned. Move them into the map.
 
@@ -235,16 +237,14 @@ pub fn decrypt(
 
 const testing = std.testing;
 
-fn binAvailable(name: []const u8) bool {
-    const a = testing.allocator;
-    const argv = [_][]const u8{ "sh", "-c", "" };
-    _ = argv;
-    var child = std.process.Child.init(&.{ name, "--version" }, a);
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return false;
-    const term = child.wait() catch return false;
-    _ = term;
+fn binAvailable(io: std.Io, name: []const u8) bool {
+    var child = std.process.spawn(io, .{
+        .argv = &.{ name, "--version" },
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .stdin = .ignore,
+    }) catch return false;
+    _ = child.wait(io) catch return false;
     return true;
 }
 
@@ -282,14 +282,16 @@ fn parsePubKey(content: []const u8) ?[]const u8 {
 }
 
 test "encrypt/decrypt roundtrip with age + sops" {
-    if (!binAvailable("sops") or !binAvailable("age-keygen")) {
+    if (!binAvailable(std.testing.io, "sops") or !binAvailable(std.testing.io, "age-keygen")) {
         return error.SkipZigTest;
     }
     const a = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(a, ".");
+    var _path_buf: [4096]u8 = undefined;
+    const _path_len = try tmp.dir.realPath(std.testing.io, &_path_buf);
+    const tmp_path = try a.dupe(u8, _path_buf[0.._path_len]);
     defer a.free(tmp_path);
 
     const id_path = try std.fs.path.join(a, &.{ tmp_path, "id.key" });
@@ -299,17 +301,19 @@ test "encrypt/decrypt roundtrip with age + sops" {
 
     // age-keygen -o <id_path>
     {
-        var child = std.process.Child.init(&.{ "age-keygen", "-o", id_path }, a);
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
-        const t = try child.wait();
+        var child = try std.process.spawn(std.testing.io, .{
+            .argv = &.{ "age-keygen", "-o", id_path },
+            .stdout = .ignore,
+            .stderr = .ignore,
+            .stdin = .ignore,
+        });
+        const t = try child.wait(std.testing.io);
         switch (t) {
-            .Exited => |c| try testing.expectEqual(@as(u8, 0), c),
+            .exited => |c| try testing.expectEqual(@as(u8, 0), c),
             else => return error.AgeKeygenFailed,
         }
     }
-    const id_content = try tmp.dir.readFileAlloc(a, "id.key", 16 * 1024);
+    const id_content = try tmp.dir.readFileAlloc(std.testing.io, "id.key", a, .limited(16 * 1024));
     defer a.free(id_content);
     const pub_slice = parsePubKey(id_content) orelse return error.NoPubKey;
     const pub_owned = try a.dupe(u8, pub_slice);
@@ -322,9 +326,9 @@ test "encrypt/decrypt roundtrip with age + sops" {
     try kv.put("EMPTY", "");
 
     const recipients = [_][]const u8{pub_owned};
-    try encrypt(a, dst_path, kv, &recipients);
+    try encrypt(std.testing.io, a, dst_path, kv, &recipients);
 
-    var got = try decrypt(a, dst_path, id_path);
+    var got = try decrypt(std.testing.io, a, dst_path, id_path);
     defer got.deinit();
 
     try testing.expectEqual(@as(usize, 3), got.inner.count());

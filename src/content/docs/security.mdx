@@ -103,7 +103,7 @@ secrets manager.
   remember `echo "..." | envless set`. Use `read -s` or paste via a
   here-string with leading whitespace.
 - **Supply-chain attacks on the Zig stdlib or vendored deps.**
-  `envless` ships zero runtime dependencies beyond Zig 0.13.0's
+  `envless` ships zero runtime dependencies beyond Zig 0.16.0's
   stdlib + libc; age + sops are external binaries. See
   [Audit & supply chain](#audit--supply-chain).
 - **Plaintext logs from your application.** If your code does
@@ -572,7 +572,7 @@ The audit surface is intentionally narrow.
 
 ### Direct dependencies
 
-Zero runtime dependencies beyond Zig 0.13.0's stdlib + libc. The
+Zero runtime dependencies beyond Zig 0.16.0's stdlib + libc. The
 subcommand dispatcher, flag parser, dotenv parser, and sops/age
 shells are all hand-rolled in `zig/src/` (~1760 LOC including inline
 tests). No cobra, no pflag, no vendored crates — `zig build` runs
@@ -614,7 +614,7 @@ The release pipeline ([`.github/workflows/release.yml`][gh-release])
 runs `zig build release -Dversion=<tag>` on `ubuntu-latest`
 GitHub-hosted runners. The build:
 
-- Pins Zig 0.13.0 via `goto-bus-stop/setup-zig@v2`.
+- Pins Zig 0.16.0 via `goto-bus-stop/setup-zig@v2`.
 - Cross-compiles each target with `-Doptimize=ReleaseSmall` — small
   stripped static binary, no debug symbols.
 - Targets `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-macos`,

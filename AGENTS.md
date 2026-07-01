@@ -29,20 +29,35 @@ Both installed at project scope via:
 
 5. **rtk is not a skill.** Never appears in the skills list. Invoked only as a Bash prefix per the rules in `CLAUDE.md`.
 
-## Zig toolchain — macOS 26 Tahoe blocker
+## Zig toolchain — 0.16.0 migration
 
-The Zig codebase is pinned to **0.13.0** (`zig/.zigversion`). On macOS 26 (Tahoe) the 0.13.0 linker fails with `undefined symbol: _arc4random_buf`, `_exit`, `_posix_memalign`, etc. — Tahoe's SDK exposes a different libSystem ABI than 0.13.0 expects.
+The Zig codebase is pinned to **0.16.0** (`zig/.zigversion`). The codebase was migrated from 0.13.0 → 0.16.0, which resolved the macOS 26 Tahoe linker errors (0.13.0's bundled `libSystem.tbd` lacked symbols that Tahoe's SDK exposes).
 
-What this means for local benchmarking:
-- `bash bench/run.sh` on macOS 26 will run the Go leg only. The Zig leg's build step fails inside `hyperfine`, the harness skips the Zig toolchain cleanly, and the verbose result JSON has `toolchains: [{go: ...}]` with no zig entry.
-- CI (`.github/workflows/ci-zig.yml`, `bench.yml`) uses Ubuntu runners where 0.13.0 links fine — Zig metrics will appear in CI artifacts.
+### What changed in the migration
 
-Workarounds (if you must benchmark Zig locally on macOS 26):
-1. Wait for Zig 0.14/0.15 macOS-26 fixes and port the codebase (stdlib churn: `std.fs.cwd`, `std.process.Child`).
-2. Use Linux (VM, Docker, remote runner).
-3. Downgrade macOS — not recommended.
+- `std.fs.*` → `std.Io.Dir.*` / `std.Io.File.*` (unified I/O interface)
+- `std.process.Child` → `std.process.spawn` / `std.process.run`
+- `std.ArrayList.init(allocator)` → `.empty` + `deinit(allocator)` / `append(allocator, ...)`
+- `std.process.getEnvVarOwned` → `std.c.getenv` + `std.mem.span` + `allocator.dupe`
+- `std.process.getEnvMap` → iterate `std.c.environ` directly
+- `std.net.Address.initUnix` → `std.Io.net.UnixAddress.init`
+- `std.crypto.random.bytes` → `std.Io.randomSecure`
+- `std.time.timestamp()` → `std.Io.Timestamp.now(io, .real).nanoseconds`
+- `callconv(.C)` → `callconv(.c)`
+- Writer/Reader pattern: `file.writer()` → `file.writer(io, &buf)` + `.interface` + `.flush()`
+- `.Exited` → `.exited`, `.Signal` → `.signal` (lowercase enum variants)
 
-Don't "fix" the Tahoe linker error by sprinkling `-lc` or `--sysroot` hacks in `build.zig`. The codebase ports cleanly to 0.14; the right move when this becomes painful is to bump `.zigversion` to 0.14 and update the stdlib calls.
+### Gotchas fixed during migration
+
+1. **`ipc.socketPath` mkdir** — `createDirPath` was commented out ("io not available here yet"). Fixed by threading `io` through `socketPath`.
+2. **`daemon.handleClient` buffer** — Was 4096-byte fixed stack buffer; large IPC requests (>4KB) returned `StreamTooLong`. Fixed with 1MB heap-allocated buffer.
+3. **`daemon.serveExec` stdout/stderr drain** — Was sequential, causing deadlock when child writes > pipe buffer to one stream. Fixed with `std.Io.File.MultiReader` for concurrent drain.
+4. **`sops.decrypt` shell injection** — Was using `sh -c "SOPS_AGE_KEY_FILE={s} exec sops ..."` (shell injection risk). Fixed with `std.process.run` + `.environ_map`.
+5. **`backup.copyFile` buffer aliasing** — Reader's internal buffer was used as read destination. Fixed with separate `data_buf`.
+
+### Local builds
+
+`zig build` and `zig build test` work natively on macOS 26 (Tahoe) with Zig 0.16.0. No Docker/OrbStack workaround needed.
 
 ## Bash exception: bench/run.sh
 
@@ -107,7 +122,7 @@ Rationale:
 
 Schema per line (extend, never rename):
 ```json
-{"schema_version":1,"sha":"<full-sha>","ref":"<tag-or-branch>","timestamp":"<iso8601>","os":"darwin","arch":"arm64","toolchain":{"go":"1.26.0","zig":"0.13.0"},"binaries":{"go":{"build_ms":...,"size_b":...,"cold_start_ms":...,"list_ms":...,"exec_ms":...,"rss_b":...,"e2e_s":...},"zig":{...}}}
+{"schema_version":1,"sha":"<full-sha>","ref":"<tag-or-branch>","timestamp":"<iso8601>","os":"darwin","arch":"arm64","toolchain":{"go":"1.26.0","zig":"0.16.0"},"binaries":{"go":{"build_ms":...,"size_b":...,"cold_start_ms":...,"list_ms":...,"exec_ms":...,"rss_b":...,"e2e_s":...},"zig":{...}}}
 ```
 
 Bench harness writes one line via `>>` append. Per-SHA detail JSONs (`bench/results/<sha>.json`) stay as the verbose source for raw hyperfine output; `history.jsonl` is the summarized index the changelog renderer reads. Both committed.

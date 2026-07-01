@@ -10,7 +10,7 @@ surface: getting set up, writing tests that fit, and cutting a release.
 
 ### Prerequisites
 
-- **Zig 0.13.0** — pinned in `zig/.zigversion`. Install from
+- **Zig 0.16.0** — pinned in `zig/.zigversion`. Install from
   [ziglang.org/download](https://ziglang.org/download/).
 - **age** ≥ 1.2 — `brew install age` / `apt install age`
 - **sops** ≥ 3.9 — install from
@@ -40,14 +40,20 @@ at `zig-out/bin/envless`. For an optimised build pass
 .
 ├── zig/
 │   ├── build.zig                   # build graph (run, test, e2e, release)
-│   ├── .zigversion                 # pinned Zig version
+│   ├── .zigversion                 # pinned Zig version (0.16.0)
 │   └── src/
-│       ├── main.zig                # entrypoint (21 LOC)
+│       ├── main.zig                # entrypoint (24 LOC)
 │       ├── cli/                    # hand-rolled subcommand dispatcher
 │       ├── execenv.zig             # env merge + child spawn
 │       ├── sops.zig                # sops binary wrapper
 │       ├── store.zig               # filesystem layout, KV
 │       ├── envparse.zig            # .env parser
+│       ├── daemon.zig              # optional decrypt-cache daemon (Unix socket)
+│       ├── ipc.zig                 # wire protocol for daemon ↔ client IPC
+│       ├── mcp.zig                 # MCP server (JSON-RPC 2.0 over stdio)
+│       ├── backup.zig              # tar.gz backup of encrypted artefacts
+│       ├── launchd.zig             # macOS launchd supervisor integration
+│       ├── systemd.zig             # Linux systemd supervisor integration
 │       └── e2e.zig                 # end-to-end test harness
 ├── bench/                          # benchmark harness + results (one bash exception)
 ├── src/                            # docs site (Astro + Starlight)
@@ -118,12 +124,12 @@ pnpm build        # production build → dist/
 
 GH Pages deploys are handled by [`.github/workflows/docs.yml`][gh-docs-yml].
 
-### macOS 26 (Tahoe) blocker
+### macOS notes
 
-Zig 0.13.0's linker fails against the Tahoe SDK
-(`undefined symbol: _arc4random_buf`, etc.). Locally on macOS 26,
-build inside a Linux container (the documented OrbStack workflow in
-`AGENTS.md`). CI on Ubuntu is unaffected.
+Zig 0.16.0 links cleanly on macOS 26 (Tahoe). The previous 0.13.0
+linker failure (`undefined symbol: _arc4random_buf`, etc.) is
+resolved by the 0.16 stdlib's updated libSystem ABI. No special
+workarounds are needed — build natively with `zig build`.
 
 ## Testing
 
@@ -136,8 +142,8 @@ real binary and shells out.
 
 ```bash
 cd zig
-zig build test        # 37 inline unit tests
-zig build e2e         # 6 end-to-end tests against the built binary
+zig build test        # 75 inline unit tests
+zig build e2e         # 18 end-to-end tests against the built binary
 ```
 
 CI runs both on every PR (see [`.github/workflows/ci.yml`][gh-ci]).
@@ -216,7 +222,7 @@ test "parse" {
 - **No mocks for `sops` or `age`.** They are real binaries; the e2e
   suite uses them. Mocking the boundary defeats the test's purpose.
 - **No `std.time.sleep`** to "wait for sops to finish."
-  `std.process.Child.spawnAndWait` is synchronous. If you find
+  `std.process.run` is synchronous. If you find
   yourself wanting a sleep, look harder.
 - **No global fixtures.** Each e2e test gets its own `makeTmpDir()`
   and cleans it up.
@@ -240,7 +246,7 @@ The pipeline ([`.github/workflows/release.yml`][gh-release-yml])
 triggers on `push: tags: ['v*']`:
 
 1. Check out at depth 0.
-2. Set up Zig 0.13.0 (`goto-bus-stop/setup-zig@v2`).
+2. Set up Zig 0.16.0 (`goto-bus-stop/setup-zig@v2`).
 3. Run `zig build release -Dversion=${{ github.ref_name }}` from
    `zig/`. This cross-builds the binary for the four release targets
    (`x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-macos`,

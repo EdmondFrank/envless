@@ -21,13 +21,13 @@ pub const Entry = struct {
 /// from the input slice), so the caller is free to drop `content` after the call.
 /// Caller owns the result and must call `freeEntries(allocator, entries)`.
 pub fn parse(allocator: std.mem.Allocator, content: []const u8) ![]Entry {
-    var list = std.ArrayList(Entry).init(allocator);
+    var list: std.ArrayList(Entry) = .empty;
     errdefer {
         for (list.items) |e| {
             allocator.free(e.key);
             allocator.free(e.value);
         }
-        list.deinit();
+        list.deinit(allocator);
     }
 
     var it = std.mem.splitScalar(u8, content, '\n');
@@ -47,10 +47,10 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) ![]Entry {
         const key_dup = try allocator.dupe(u8, key_trim);
         errdefer allocator.free(key_dup);
         const val_dup = try allocator.dupe(u8, val_parsed);
-        try list.append(.{ .key = key_dup, .value = val_dup });
+        try list.append(allocator, .{ .key = key_dup, .value = val_dup });
     }
 
-    return list.toOwnedSlice();
+    return list.toOwnedSlice(allocator);
 }
 
 pub fn freeEntries(allocator: std.mem.Allocator, entries: []Entry) void {

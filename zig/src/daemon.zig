@@ -65,7 +65,7 @@ pub const Cache = struct {
     pub fn init(allocator: std.mem.Allocator, capacity: usize, ttl_ns: i128) Cache {
         return .{
             .allocator = allocator,
-            .entries = std.ArrayList(*CacheEntry).init(allocator),
+            .entries = .empty,
             .capacity = capacity,
             .ttl_ns = ttl_ns,
         };
@@ -76,7 +76,7 @@ pub const Cache = struct {
             e.deinit(self.allocator);
             self.allocator.destroy(e);
         }
-        self.entries.deinit();
+        self.entries.deinit(self.allocator);
     }
 
     pub fn lookup(self: *Cache, key: []const u8, now_ns: i128) ?*CacheEntry {
@@ -120,7 +120,7 @@ pub const Cache = struct {
             self.allocator.destroy(evicted);
             _ = self.entries.orderedRemove(oldest_idx);
         }
-        try self.entries.append(entry);
+        try self.entries.append(self.allocator, entry);
     }
 
     pub fn invalidate(self: *Cache, key: []const u8) void {
@@ -146,7 +146,7 @@ fn wipe(buf: []const u8) void {
     // the allocator; casting to mutable is sound here because the daemon
     // is the only writer.
     const mutable: []u8 = @constCast(buf);
-    std.crypto.utils.secureZero(u8, mutable);
+    std.crypto.secureZero(u8, mutable);
 }
 
 // ----------------------------- daemon main ----------------------------------
@@ -155,20 +155,21 @@ var g_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true);
 var g_socket_path_for_cleanup: ?[]const u8 = null;
 var g_cache_for_cleanup: ?*Cache = null;
 
-fn onSignal(_: c_int) callconv(.C) void {
+fn onSignal(_: std.posix.SIG) callconv(.c) void {
     g_running.store(false, .release);
 }
 
 /// run: foreground daemon entrypoint. Returns on SIGTERM/SIGINT or an
 /// unrecoverable accept error.
-pub fn run(allocator: std.mem.Allocator) !void {
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
+pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
+    const home_ptr = std.c.getenv("HOME") orelse return error.EnvironmentVariableMissing;
+    const home = try allocator.dupe(u8, std.mem.span(home_ptr));
     defer allocator.free(home);
-    const sock_path = try ipc.socketPath(allocator, home);
+    const sock_path = try ipc.socketPath(allocator, io, home);
     defer allocator.free(sock_path);
 
     // Best-effort cleanup of orphan socket.
-    std.fs.cwd().deleteFile(sock_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, sock_path) catch {};
 
     var cache = Cache.init(allocator, CACHE_CAPACITY, CACHE_TTL_NS);
     defer cache.deinit();
@@ -178,115 +179,131 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
     installSignalHandlers();
 
-    const addr = try std.net.Address.initUnix(sock_path);
-    var server = try addr.listen(.{});
-    defer server.deinit();
+    const addr = try std.Io.net.UnixAddress.init(sock_path);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
 
-    const stderr = std.io.getStdErr().writer();
-    stderr.print("[envless daemon] listening on {s} (cache cap={d} ttl={d}s)\n", .{ sock_path, CACHE_CAPACITY, @divTrunc(CACHE_TTL_NS, std.time.ns_per_s) }) catch {};
+    var err_buf: [4096]u8 = undefined;
+    var stderr = std.Io.File.stderr().writer(io, &err_buf);
+    stderr.interface.print("[envless daemon] listening on {s} (cache cap={d} ttl={d}s)\n", .{ sock_path, CACHE_CAPACITY, @divTrunc(CACHE_TTL_NS, std.time.ns_per_s) }) catch {};
+    stderr.flush() catch {};
 
     while (g_running.load(.acquire)) {
-        const conn = server.accept() catch |err| switch (err) {
+        const conn = server.accept(io) catch |err| switch (err) {
             error.SocketNotListening => break,
             else => {
-                stderr.print("[envless daemon] accept failed: {s}\n", .{@errorName(err)}) catch {};
+                stderr.interface.print("[envless daemon] accept failed: {s}\n", .{@errorName(err)}) catch {};
+                stderr.flush() catch {};
                 continue;
             },
         };
-        defer conn.stream.close();
-        handleClient(allocator, &cache, conn.stream) catch |err| {
-            stderr.print("[envless daemon] client failed: {s}\n", .{@errorName(err)}) catch {};
+        defer conn.close(io);
+        handleClient(allocator, io, &cache, conn) catch |err| {
+            stderr.interface.print("[envless daemon] client failed: {s}\n", .{@errorName(err)}) catch {};
+            stderr.flush() catch {};
         };
     }
 
     // Best-effort wipe of the cache on shutdown.
     cache.deinit();
-    cache.entries = std.ArrayList(*CacheEntry).init(allocator); // reset to empty
-    std.fs.cwd().deleteFile(sock_path) catch {};
+    cache.entries = .empty; // reset to empty
+    std.Io.Dir.cwd().deleteFile(io, sock_path) catch {};
 }
 
 fn installSignalHandlers() void {
     if (builtin.os.tag == .windows) return;
     var act = std.posix.Sigaction{
         .handler = .{ .handler = onSignal },
-        .mask = std.posix.empty_sigset,
+        .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
-    _ = std.posix.sigaction(std.posix.SIG.TERM, &act, null) catch {};
-    _ = std.posix.sigaction(std.posix.SIG.INT, &act, null) catch {};
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
     // Ignore SIGPIPE — clients dropping mid-write must not kill the daemon.
     var ign = std.posix.Sigaction{
         .handler = .{ .handler = std.posix.SIG.IGN },
-        .mask = std.posix.empty_sigset,
+        .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
-    _ = std.posix.sigaction(std.posix.SIG.PIPE, &ign, null) catch {};
+    std.posix.sigaction(std.posix.SIG.PIPE, &ign, null);
 }
 
 // ----------------------------- per-client loop ------------------------------
 
-const MAX_LINE: usize = 64 * 1024 * 1024;
-
-fn handleClient(allocator: std.mem.Allocator, cache: *Cache, stream: std.net.Stream) !void {
-    // Read exactly one request line, dispatch, write the response.
-    var line_buf = std.ArrayList(u8).init(allocator);
-    defer line_buf.deinit();
-
-    var reader = stream.reader();
-    reader.streamUntilDelimiter(line_buf.writer(), '\n', MAX_LINE) catch |err| switch (err) {
-        error.EndOfStream => {
-            if (line_buf.items.len == 0) return;
-        },
-        else => return err,
-    };
-    const line = std.mem.trimRight(u8, line_buf.items, " \t\r\n");
-    if (line.len == 0) return;
-
+fn handleClient(allocator: std.mem.Allocator, io: std.Io, cache: *Cache, stream: std.Io.net.Stream) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
+    // Read exactly one request line, dispatch, write the response.
+    // Use a heap-allocated buffer large enough for big SET values or EXEC
+    // payloads. The old 0.13 code used a dynamically-growing ArrayList with
+    // a 64MB cap; 1MB is sufficient for any practical request and still
+    // far below the old limit.
+    const read_buf = try a.alloc(u8, 1024 * 1024);
+    var reader = stream.reader(io, read_buf);
+
+    const line_bytes = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+        error.EndOfStream => return,
+        error.StreamTooLong => {
+            const payload = try ipc.errPayload(a, "request_too_long", "request line exceeds 1MB limit");
+            const resp = try ipc.encodeErr(a, payload);
+            try streamWriteAll(io, stream, resp);
+            return;
+        },
+        else => return err,
+    };
+    const line = std.mem.trimEnd(u8, line_bytes, " \t\r\n");
+    if (line.len == 0) return;
+
     const req = ipc.parseRequest(line) catch {
         const payload = try ipc.errPayload(a, "malformed", "request line is malformed");
         const resp = try ipc.encodeErr(a, payload);
-        try stream.writer().writeAll(resp);
+        try streamWriteAll(io, stream, resp);
         return;
     };
 
     switch (req) {
         .ping => {
             const resp = try ipc.encodeOk(a, "{}");
-            try stream.writer().writeAll(resp);
+            try streamWriteAll(io, stream, resp);
         },
-        .whoami => try serveWhoami(a, stream),
-        .list => |x| try serveList(a, cache, stream, x.env),
-        .get => |x| try serveGet(a, cache, stream, x.env, x.key),
-        .set => |x| try serveSet(a, cache, stream, x.env, x.key, x.value),
-        .exec => |x| try serveExec(a, cache, stream, x),
+        .whoami => try serveWhoami(a, io, stream),
+        .list => |x| try serveList(a, io, cache, stream, x.env),
+        .get => |x| try serveGet(a, io, cache, stream, x.env, x.key),
+        .set => |x| try serveSet(a, io, cache, stream, x.env, x.key, x.value),
+        .exec => |x| try serveExec(a, io, cache, stream, x),
     }
 }
 
-fn cwdAlloc(a: std.mem.Allocator) ![]u8 {
-    var buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-    const s = try std.process.getCwd(&buf);
-    return a.dupe(u8, s);
+/// Write all bytes to a stream via a stack buffer.
+fn streamWriteAll(io: std.Io, stream: std.Io.net.Stream, data: []const u8) !void {
+    var w_buf: [4096]u8 = undefined;
+    var w = stream.writer(io, &w_buf);
+    try w.interface.writeAll(data);
+}
+
+fn cwdAlloc(a: std.mem.Allocator, io: std.Io) ![]u8 {
+    var buf: [4096]u8 = undefined;
+    const len = try std.process.currentPath(io, &buf);
+    return a.dupe(u8, buf[0..len]);
 }
 
 fn cacheKey(a: std.mem.Allocator, root: []const u8, env: []const u8) ![]u8 {
     return std.fmt.allocPrint(a, "{s}\x00{s}", .{ root, env });
 }
 
-fn readDecryptedCached(a: std.mem.Allocator, cache: *Cache, root: []const u8, env: []const u8) !*CacheEntry {
+fn readDecryptedCached(a: std.mem.Allocator, io: std.Io, cache: *Cache, root: []const u8, env: []const u8) !*CacheEntry {
     const key = try cacheKey(a, root, env);
-    const now = std.time.nanoTimestamp();
+    const now = std.Io.Timestamp.now(io, .real).nanoseconds;
 
     // Probe disk for current mtime so we can invalidate on edit.
-    const s_for_path = store.Store.init(a, root);
+    const s_for_path = store.Store.init(a, io, root);
     const file_path = try s_for_path.secretsPath(a, env);
     defer a.free(file_path);
     var mtime_ns: i128 = 0;
-    if (std.fs.cwd().statFile(file_path)) |st| {
-        mtime_ns = st.mtime;
+    if (std.Io.Dir.cwd().statFile(io, file_path, .{})) |st| {
+        mtime_ns = st.mtime.nanoseconds;
     } else |_| {
         // File may not exist yet (e.g. fresh init before any set). That's
         // fine — empty map.
@@ -299,7 +316,7 @@ fn readDecryptedCached(a: std.mem.Allocator, cache: *Cache, root: []const u8, en
 
     // Cold path: decrypt fresh, then insert.
     const persistent_alloc = cache.allocator;
-    const s = store.Store.init(persistent_alloc, root);
+    const s = store.Store.init(persistent_alloc, io, root);
     var kv = try s.read(env);
     errdefer kv.deinit();
 
@@ -316,92 +333,92 @@ fn readDecryptedCached(a: std.mem.Allocator, cache: *Cache, root: []const u8, en
     return entry;
 }
 
-fn serveList(a: std.mem.Allocator, cache: *Cache, stream: std.net.Stream, env: []const u8) !void {
-    const cwd = try cwdAlloc(a);
+fn serveList(a: std.mem.Allocator, io: std.Io, cache: *Cache, stream: std.Io.net.Stream, env: []const u8) !void {
+    const cwd = try cwdAlloc(a, io);
 
-    const entry = readDecryptedCached(a, cache, cwd, env) catch |err| {
+    const entry = readDecryptedCached(a, io, cache, cwd, env) catch |err| {
         const payload = try ipc.errPayload(a, "decrypt_failed", @errorName(err));
         const resp = try ipc.encodeErr(a, payload);
-        try stream.writer().writeAll(resp);
+        try streamWriteAll(io, stream, resp);
         return;
     };
 
-    var keys = std.ArrayList([]const u8).init(a);
-    defer keys.deinit();
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer keys.deinit(a);
     var it = entry.map.inner.iterator();
-    while (it.next()) |e| try keys.append(e.key_ptr.*);
+    while (it.next()) |e| try keys.append(a, e.key_ptr.*);
     std.mem.sort([]const u8, keys.items, {}, struct {
         fn lt(_: void, x: []const u8, y: []const u8) bool {
             return std.mem.lessThan(u8, x, y);
         }
     }.lt);
 
-    var json_buf = std.ArrayList(u8).init(a);
-    defer json_buf.deinit();
-    try json_buf.appendSlice("{\"keys\":[");
+    var json_buf: std.ArrayList(u8) = .empty;
+    defer json_buf.deinit(a);
+    try json_buf.appendSlice(a, "{\"keys\":[");
     for (keys.items, 0..) |k, i| {
-        if (i != 0) try json_buf.append(',');
-        try json_buf.append('"');
+        if (i != 0) try json_buf.append(a, ',');
+        try json_buf.append(a, '"');
         // Keys are ASCII identifiers in practice; we still escape defensively.
         for (k) |c| switch (c) {
-            '"' => try json_buf.appendSlice("\\\""),
-            '\\' => try json_buf.appendSlice("\\\\"),
-            else => try json_buf.append(c),
+            '"' => try json_buf.appendSlice(a, "\\\""),
+            '\\' => try json_buf.appendSlice(a, "\\\\"),
+            else => try json_buf.append(a, c),
         };
-        try json_buf.append('"');
+        try json_buf.append(a, '"');
     }
-    try json_buf.appendSlice("]}");
+    try json_buf.appendSlice(a, "]}");
     const resp = try ipc.encodeOk(a, json_buf.items);
-    try stream.writer().writeAll(resp);
+    try streamWriteAll(io, stream, resp);
 }
 
-fn serveGet(a: std.mem.Allocator, cache: *Cache, stream: std.net.Stream, env: []const u8, key: []const u8) !void {
-    const cwd = try cwdAlloc(a);
-    const entry = readDecryptedCached(a, cache, cwd, env) catch |err| {
+fn serveGet(a: std.mem.Allocator, io: std.Io, cache: *Cache, stream: std.Io.net.Stream, env: []const u8, key: []const u8) !void {
+    const cwd = try cwdAlloc(a, io);
+    const entry = readDecryptedCached(a, io, cache, cwd, env) catch |err| {
         const payload = try ipc.errPayload(a, "decrypt_failed", @errorName(err));
         const resp = try ipc.encodeErr(a, payload);
-        try stream.writer().writeAll(resp);
+        try streamWriteAll(io, stream, resp);
         return;
     };
     const v = entry.map.inner.get(key) orelse {
         const payload = try ipc.errPayload(a, "not_found", "key not found");
         const resp = try ipc.encodeErr(a, payload);
-        try stream.writer().writeAll(resp);
+        try streamWriteAll(io, stream, resp);
         return;
     };
     // {"value":"<escaped>"}
-    var buf = std.ArrayList(u8).init(a);
-    defer buf.deinit();
-    try buf.appendSlice("{\"value\":");
-    try jsonString(&buf, v);
-    try buf.append('}');
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "{\"value\":");
+    try jsonString(a, &buf, v);
+    try buf.append(a, '}');
     const resp = try ipc.encodeOk(a, buf.items);
-    try stream.writer().writeAll(resp);
+    try streamWriteAll(io, stream, resp);
 }
 
-fn serveSet(a: std.mem.Allocator, cache: *Cache, stream: std.net.Stream, env: []const u8, key: []const u8, value: []const u8) !void {
-    const cwd = try cwdAlloc(a);
-    const s = store.Store.init(a, cwd);
+fn serveSet(a: std.mem.Allocator, io: std.Io, cache: *Cache, stream: std.Io.net.Stream, env: []const u8, key: []const u8, value: []const u8) !void {
+    const cwd = try cwdAlloc(a, io);
+    const s = store.Store.init(a, io, cwd);
     s.set(env, key, value) catch |err| {
         const payload = try ipc.errPayload(a, "set_failed", @errorName(err));
         const resp = try ipc.encodeErr(a, payload);
-        try stream.writer().writeAll(resp);
+        try streamWriteAll(io, stream, resp);
         return;
     };
     // Drop the cached entry so the next read sees the new file mtime.
     const ckey = try cacheKey(a, cwd, env);
     cache.invalidate(ckey);
     const resp = try ipc.encodeOk(a, "{\"ok\":true}");
-    try stream.writer().writeAll(resp);
+    try streamWriteAll(io, stream, resp);
 }
 
-fn serveWhoami(a: std.mem.Allocator, stream: std.net.Stream) !void {
-    const cwd = try cwdAlloc(a);
-    const s = store.Store.init(a, cwd);
+fn serveWhoami(a: std.mem.Allocator, io: std.Io, stream: std.Io.net.Stream) !void {
+    const cwd = try cwdAlloc(a, io);
+    const s = store.Store.init(a, io, cwd);
     const pubkey = s.pubKey() catch |err| {
         const payload = try ipc.errPayload(a, "no_identity", @errorName(err));
         const resp = try ipc.encodeErr(a, payload);
-        try stream.writer().writeAll(resp);
+        try streamWriteAll(io, stream, resp);
         return;
     };
     var recipients_count: usize = 0;
@@ -413,45 +430,45 @@ fn serveWhoami(a: std.mem.Allocator, stream: std.net.Stream) !void {
         recipients_count = recs.len;
     } else |_| {}
 
-    var buf = std.ArrayList(u8).init(a);
-    defer buf.deinit();
-    try buf.appendSlice("{\"pubkey\":");
-    try jsonString(&buf, pubkey);
-    try buf.writer().print(",\"recipients\":{d}}}", .{recipients_count});
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "{\"pubkey\":");
+    try jsonString(a, &buf, pubkey);
+    try buf.print(a, ",\"recipients\":{d}}}", .{recipients_count});
     const resp = try ipc.encodeOk(a, buf.items);
-    try stream.writer().writeAll(resp);
+    try streamWriteAll(io, stream, resp);
 }
 
-fn serveExec(a: std.mem.Allocator, cache: *Cache, stream: std.net.Stream, x: ipc.ExecRequest) !void {
+fn serveExec(a: std.mem.Allocator, io: std.Io, cache: *Cache, stream: std.Io.net.Stream, x: ipc.ExecRequest) !void {
     // EXEC routes through the cached decrypt path so repeated invocations
     // are cheap. The actual child env+spawn lives in execenv; we capture
     // stdout/stderr and ship them back as a JSON payload.
     const cwd_for_child = x.cwd;
-    const root_for_decrypt = try cwdAlloc(a);
+    const root_for_decrypt = try cwdAlloc(a, io);
 
-    const entry = readDecryptedCached(a, cache, root_for_decrypt, x.env) catch |err| {
+    const entry = readDecryptedCached(a, io, cache, root_for_decrypt, x.env) catch |err| {
         const payload = try ipc.errPayload(a, "decrypt_failed", @errorName(err));
         const resp = try ipc.encodeErr(a, payload);
-        try stream.writer().writeAll(resp);
+        try streamWriteAll(io, stream, resp);
         return;
     };
 
     const argv = ipc.decodeArgvB64(a, x.argv_b64) catch {
         const payload = try ipc.errPayload(a, "argv_decode", "argv_b64 invalid");
         const resp = try ipc.encodeErr(a, payload);
-        try stream.writer().writeAll(resp);
+        try streamWriteAll(io, stream, resp);
         return;
     };
     if (argv.len == 0) {
         const payload = try ipc.errPayload(a, "argv_empty", "argv must not be empty");
         const resp = try ipc.encodeErr(a, payload);
-        try stream.writer().writeAll(resp);
+        try streamWriteAll(io, stream, resp);
         return;
     }
     const stdin_text = ipc.decodeBytesB64(a, x.stdin_b64) catch {
         const payload = try ipc.errPayload(a, "stdin_decode", "stdin_b64 invalid");
         const resp = try ipc.encodeErr(a, payload);
-        try stream.writer().writeAll(resp);
+        try streamWriteAll(io, stream, resp);
         return;
     };
 
@@ -459,84 +476,138 @@ fn serveExec(a: std.mem.Allocator, cache: *Cache, stream: std.net.Stream, x: ipc
     for (argv, 0..) |s, i| argv_view[i] = s;
 
     // Build child env: daemon env + secrets.
-    var env_map = std.process.getEnvMap(a) catch unreachable;
-    defer env_map.deinit();
-    var parent = std.ArrayList([]const u8).init(a);
-    defer parent.deinit();
-    var it = env_map.iterator();
-    while (it.next()) |e| {
-        try parent.append(try std.fmt.allocPrint(a, "{s}={s}", .{ e.key_ptr.*, e.value_ptr.* }));
+    var parent: std.ArrayList([]const u8) = .empty;
+    defer parent.deinit(a);
+    {
+        var i: usize = 0;
+        while (std.c.environ[i]) |entry_ptr| : (i += 1) {
+            const e = std.mem.span(entry_ptr);
+            try parent.append(a, try a.dupe(u8, e));
+        }
     }
     const child_env = try execenv.buildEnv(a, parent.items, entry.map.inner);
 
-    var child = std.process.Child.init(argv_view, a);
-    var child_env_map = std.process.EnvMap.init(a);
-    defer child_env_map.deinit();
+    // Build Environ.Map for spawn.
+    var env_map = std.process.Environ.Map.init(a);
+    defer env_map.deinit();
     for (child_env) |kv_str| {
         const eq = std.mem.indexOfScalar(u8, kv_str, '=') orelse continue;
-        try child_env_map.put(kv_str[0..eq], kv_str[eq + 1 ..]);
+        try env_map.put(kv_str[0..eq], kv_str[eq + 1 ..]);
     }
-    child.env_map = &child_env_map;
-    child.cwd = cwd_for_child;
-    child.stdin_behavior = if (stdin_text.len > 0) .Pipe else .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    child.spawn() catch |err| {
+
+    var child = std.process.spawn(io, .{
+        .argv = argv_view,
+        .environ_map = &env_map,
+        .cwd = .{ .path = cwd_for_child },
+        .stdin = if (stdin_text.len > 0) .pipe else .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |err| {
         const payload = try ipc.errPayload(a, "spawn_failed", @errorName(err));
         const resp = try ipc.encodeErr(a, payload);
-        try stream.writer().writeAll(resp);
+        try streamWriteAll(io, stream, resp);
         return;
     };
+
     if (stdin_text.len > 0) {
-        if (child.stdin) |stdin| {
-            stdin.writeAll(stdin_text) catch {};
-            stdin.close();
+        if (child.stdin) |stdin_file| {
+            var w_buf: [4096]u8 = undefined;
+            var sw = stdin_file.writer(io, &w_buf);
+            sw.interface.writeAll(stdin_text) catch {};
+            sw.flush() catch {};
+            stdin_file.close(io);
             child.stdin = null;
         }
     }
-    var stdout_buf = std.ArrayList(u8).init(a);
-    var stderr_buf = std.ArrayList(u8).init(a);
-    child.collectOutput(&stdout_buf, &stderr_buf, 16 * 1024 * 1024) catch {};
-    const term = child.wait() catch |err| {
-        const payload = try ipc.errPayload(a, "wait_failed", @errorName(err));
+
+    // Drain stdout and stderr concurrently to avoid deadlock when the child
+    // writes more than the pipe buffer size to one stream before the other.
+    // The old 0.13 code used collectOutput which drained both concurrently;
+    // we replicate that with Io.File.MultiReader.
+    const stdout_file = child.stdout orelse {
+        const payload = try ipc.errPayload(a, "spawn_failed", "stdout pipe not available");
         const resp = try ipc.encodeErr(a, payload);
-        try stream.writer().writeAll(resp);
+        try streamWriteAll(io, stream, resp);
+        return;
+    };
+    const stderr_file = child.stderr orelse {
+        const payload = try ipc.errPayload(a, "spawn_failed", "stderr pipe not available");
+        const resp = try ipc.encodeErr(a, payload);
+        try streamWriteAll(io, stream, resp);
         return;
     };
 
+    var mr_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var mr: std.Io.File.MultiReader = undefined;
+    mr.init(a, io, mr_buffer.toStreams(), &.{ stdout_file, stderr_file });
+    defer mr.deinit();
+
+    const stdout_reader = mr.reader(0);
+    const stderr_reader = mr.reader(1);
+
+    while (mr.fill(64, .none)) |_| {
+        if (stdout_reader.buffered().len > 16 * 1024 * 1024) {
+            const payload = try ipc.errPayload(a, "output_too_large", "stdout exceeds 16MB limit");
+            const resp = try ipc.encodeErr(a, payload);
+            try streamWriteAll(io, stream, resp);
+            return;
+        }
+        if (stderr_reader.buffered().len > 16 * 1024 * 1024) {
+            const payload = try ipc.errPayload(a, "output_too_large", "stderr exceeds 16MB limit");
+            const resp = try ipc.encodeErr(a, payload);
+            try streamWriteAll(io, stream, resp);
+            return;
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    }
+
+    try mr.checkAnyError();
+
+    const term = child.wait(io) catch |err| {
+        const payload = try ipc.errPayload(a, "wait_failed", @errorName(err));
+        const resp = try ipc.encodeErr(a, payload);
+        try streamWriteAll(io, stream, resp);
+        return;
+    };
+
+    const stdout_data = try mr.toOwnedSlice(0);
+    const stderr_data = try mr.toOwnedSlice(1);
+
     var exit_code: i64 = -1;
     switch (term) {
-        .Exited => |c| exit_code = @as(i64, c),
-        .Signal => |sig| exit_code = -(@as(i64, @intCast(sig))),
+        .exited => |c| exit_code = @as(i64, c),
+        .signal => |sig| exit_code = -(@as(i64, @intCast(@intFromEnum(sig)))),
         else => exit_code = -1,
     }
-    var buf = std.ArrayList(u8).init(a);
-    defer buf.deinit();
-    try buf.writer().print("{{\"exit_code\":{d},\"stdout\":", .{exit_code});
-    try jsonString(&buf, stdout_buf.items);
-    try buf.appendSlice(",\"stderr\":");
-    try jsonString(&buf, stderr_buf.items);
-    try buf.append('}');
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.print(a, "{{\"exit_code\":{d},\"stdout\":", .{exit_code});
+    try jsonString(a, &buf, stdout_data);
+    try buf.appendSlice(a, ",\"stderr\":");
+    try jsonString(a, &buf, stderr_data);
+    try buf.append(a, '}');
     const resp = try ipc.encodeOk(a, buf.items);
-    try stream.writer().writeAll(resp);
+    try streamWriteAll(io, stream, resp);
 }
 
-fn jsonString(buf: *std.ArrayList(u8), s: []const u8) !void {
-    try buf.append('"');
+fn jsonString(a: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
+    try buf.append(a, '"');
     for (s) |c| switch (c) {
-        '"' => try buf.appendSlice("\\\""),
-        '\\' => try buf.appendSlice("\\\\"),
-        '\n' => try buf.appendSlice("\\n"),
-        '\r' => try buf.appendSlice("\\r"),
-        '\t' => try buf.appendSlice("\\t"),
+        '"' => try buf.appendSlice(a, "\\\""),
+        '\\' => try buf.appendSlice(a, "\\\\"),
+        '\n' => try buf.appendSlice(a, "\\n"),
+        '\r' => try buf.appendSlice(a, "\\r"),
+        '\t' => try buf.appendSlice(a, "\\t"),
         0...8, 11, 12, 14...31 => {
             var seq: [6]u8 = undefined;
             _ = std.fmt.bufPrint(&seq, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(&seq);
+            try buf.appendSlice(a, &seq);
         },
-        else => try buf.append(c),
+        else => try buf.append(a, c),
     };
-    try buf.append('"');
+    try buf.append(a, '"');
 }
 
 // ----------------------------- tests -----------------------------------------

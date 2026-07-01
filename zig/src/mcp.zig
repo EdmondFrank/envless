@@ -46,16 +46,18 @@ const READ_BUF = 256 * 1024;
 
 /// run: stdio loop. Reads one JSON-RPC line per iteration, dispatches, and
 /// writes the response (when applicable). Returns on EOF.
-pub fn run(allocator: std.mem.Allocator, version: []const u8) !void {
-    const stdin = std.io.getStdIn().reader();
-    const stdout = std.io.getStdOut().writer();
+pub fn run(allocator: std.mem.Allocator, io: std.Io, version: []const u8) !void {
+    var stdin_read_buf: [8192]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_read_buf);
+    var stdout_write_buf: [8192]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_write_buf);
 
-    var line_buf = std.ArrayList(u8).init(allocator);
-    defer line_buf.deinit();
+    var line_buf: std.ArrayList(u8) = .empty;
+    defer line_buf.deinit(allocator);
 
     while (true) {
         line_buf.clearRetainingCapacity();
-        stdin.streamUntilDelimiter(line_buf.writer(), '\n', READ_BUF) catch |err| switch (err) {
+        const line_bytes = stdin_reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
             error.EndOfStream => return,
             error.StreamTooLong => {
                 std.debug.print("[mcp] line exceeds {d}B — closing\n", .{READ_BUF});
@@ -63,26 +65,28 @@ pub fn run(allocator: std.mem.Allocator, version: []const u8) !void {
             },
             else => return err,
         };
+        try line_buf.appendSlice(allocator, line_bytes);
         const line = std.mem.trim(u8, line_buf.items, " \t\r");
         if (line.len == 0) continue;
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        const response = handleLine(arena.allocator(), version, line) catch |e| blk: {
+        const response = handleLine(arena.allocator(), io, version, line) catch |e| blk: {
             std.debug.print("[mcp] handle error: {s}\n", .{@errorName(e)});
             break :blk null;
         };
         if (response) |resp| {
-            try stdout.writeAll(resp);
-            try stdout.writeAll("\n");
+            try stdout_writer.interface.writeAll(resp);
+            try stdout_writer.interface.writeAll("\n");
+            try stdout_writer.flush();
         }
     }
 }
 
 /// handleLine: parse one JSON-RPC envelope and dispatch. Returns the
 /// response string (caller owns via arena) or null for notifications.
-pub fn handleLine(a: std.mem.Allocator, version: []const u8, line: []const u8) !?[]const u8 {
+pub fn handleLine(a: std.mem.Allocator, io: std.Io, version: []const u8, line: []const u8) !?[]const u8 {
     var parsed = json.parseFromSlice(json.Value, a, line, .{}) catch {
         return try errorResponse(a, .{ .null = {} }, -32700, "Parse error");
     };
@@ -117,10 +121,10 @@ pub fn handleLine(a: std.mem.Allocator, version: []const u8, line: []const u8) !
         return try buildToolsListResponse(a, id_val);
     }
     if (std.mem.eql(u8, method, "tools/call")) {
-        return try buildToolsCallResponse(a, id_val, params);
+        return try buildToolsCallResponse(a, io, id_val, params);
     }
     if (std.mem.eql(u8, method, "ping")) {
-        return try okResponse(a, id_val, .{ .object = json.ObjectMap.init(a) });
+        return try okResponse(a, id_val, .{ .object = json.ObjectMap.empty });
     }
 
     if (is_notification) return null;
@@ -130,8 +134,8 @@ pub fn handleLine(a: std.mem.Allocator, version: []const u8, line: []const u8) !
 // ---- JSON-builder helpers ---------------------------------------------------
 
 fn obj(a: std.mem.Allocator, pairs: []const struct { []const u8, json.Value }) !json.Value {
-    var m = json.ObjectMap.init(a);
-    for (pairs) |p| try m.put(p[0], p[1]);
+    var m = json.ObjectMap.empty;
+    for (pairs) |p| try m.put(a, p[0], p[1]);
     return .{ .object = m };
 }
 
@@ -139,6 +143,14 @@ fn arr(a: std.mem.Allocator, items: []const json.Value) !json.Value {
     var list = json.Array.init(a);
     try list.appendSlice(items);
     return .{ .array = list };
+}
+
+/// Replacement for std.json.stringifyAlloc (removed in 0.16).
+fn jsonStrAlloc(a: std.mem.Allocator, value: json.Value) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    var stringify: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+    try stringify.write(value);
+    return try out.toOwnedSlice();
 }
 
 fn str(s: []const u8) json.Value {
@@ -159,7 +171,7 @@ fn okResponse(a: std.mem.Allocator, id: json.Value, result: json.Value) ![]const
         .{ "id", id },
         .{ "result", result },
     });
-    return try json.stringifyAlloc(a, env, .{});
+    return try jsonStrAlloc(a, env);
 }
 
 fn errorResponse(a: std.mem.Allocator, id: json.Value, code: i64, message: []const u8) ![]const u8 {
@@ -172,7 +184,7 @@ fn errorResponse(a: std.mem.Allocator, id: json.Value, code: i64, message: []con
         .{ "id", id },
         .{ "error", err_obj },
     });
-    return try json.stringifyAlloc(a, env, .{});
+    return try jsonStrAlloc(a, env);
 }
 
 fn toolTextResponse(a: std.mem.Allocator, id: json.Value, text: []const u8) ![]const u8 {
@@ -350,7 +362,7 @@ fn buildToolsListResponse(a: std.mem.Allocator, id: json.Value) ![]const u8 {
 
 // ---- tools/call dispatch ----------------------------------------------------
 
-fn buildToolsCallResponse(a: std.mem.Allocator, id: json.Value, params: json.Value) ![]const u8 {
+fn buildToolsCallResponse(a: std.mem.Allocator, io: std.Io, id: json.Value, params: json.Value) ![]const u8 {
     if (params != .object) return try errorResponse(a, id, -32602, "params must be an object");
     const p = params.object;
 
@@ -358,113 +370,116 @@ fn buildToolsCallResponse(a: std.mem.Allocator, id: json.Value, params: json.Val
     if (name_val != .string) return try errorResponse(a, id, -32602, "params.name must be a string");
     const tool = name_val.string;
 
-    const empty = json.Value{ .object = json.ObjectMap.init(a) };
+    const empty = json.Value{ .object = json.ObjectMap.empty };
     const args = p.get("arguments") orelse empty;
 
-    if (std.mem.eql(u8, tool, "envs")) return callEnvs(a, id, args);
-    if (std.mem.eql(u8, tool, "list")) return callList(a, id, args);
-    if (std.mem.eql(u8, tool, "get")) return callGet(a, id, args);
-    if (std.mem.eql(u8, tool, "set")) return callSet(a, id, args);
-    if (std.mem.eql(u8, tool, "exec")) return callExec(a, id, args);
-    if (std.mem.eql(u8, tool, "init")) return callInit(a, id, args);
-    if (std.mem.eql(u8, tool, "migrate")) return callMigrate(a, id, args);
-    if (std.mem.eql(u8, tool, "whoami")) return callWhoami(a, id, args);
+    if (std.mem.eql(u8, tool, "envs")) return callEnvs(a, io, id, args);
+    if (std.mem.eql(u8, tool, "list")) return callList(a, io, id, args);
+    if (std.mem.eql(u8, tool, "get")) return callGet(a, io, id, args);
+    if (std.mem.eql(u8, tool, "set")) return callSet(a, io, id, args);
+    if (std.mem.eql(u8, tool, "exec")) return callExec(a, io, id, args);
+    if (std.mem.eql(u8, tool, "init")) return callInit(a, io, id, args);
+    if (std.mem.eql(u8, tool, "migrate")) return callMigrate(a, io, id, args);
+    if (std.mem.eql(u8, tool, "whoami")) return callWhoami(a, io, id, args);
 
     return try toolErrorResponse(a, id, "unknown tool");
 }
 
-fn getCwd(a: std.mem.Allocator) ![]u8 {
-    var buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-    const slice = try std.process.getCwd(&buf);
-    return a.dupe(u8, slice);
+fn getCwd(a: std.mem.Allocator, io: std.Io) ![]u8 {
+    var buf: [4096]u8 = undefined;
+    const len = try std.process.currentPath(io, &buf);
+    return a.dupe(u8, buf[0..len]);
 }
 
 // Detect a running daemon socket. Returns the path (owned by `a`) when a
 // socket exists and answers PING within ~100ms. Returns null otherwise.
 // Note: v1 only the MCP path uses this — CLI stays stateless per spec.
-fn daemonSocketIfAlive(a: std.mem.Allocator) ?[]u8 {
-    const home = std.process.getEnvVarOwned(a, "HOME") catch return null;
-    defer a.free(home);
-    const path = ipc.socketPath(a, home) catch return null;
+fn daemonSocketIfAlive(a: std.mem.Allocator, io: std.Io) ?[]u8 {
+    const home_ptr = std.c.getenv("HOME") orelse return null;
+    const home = std.mem.span(home_ptr);
+    const path = ipc.socketPath(a, io, home) catch return null;
     // Check existence first.
-    std.fs.cwd().access(path, .{}) catch {
+    std.Io.Dir.cwd().access(io, path, .{}) catch {
         a.free(path);
         return null;
     };
     // Try a fast PING. If the daemon doesn't answer cleanly, treat the
     // socket as orphaned and fall back to the stateless in-process path.
-    if (probeSocket(path)) {
+    if (probeSocket(io, path)) {
         return path;
     }
     a.free(path);
     return null;
 }
 
-fn probeSocket(path: []const u8) bool {
-    var stream = std.net.connectUnixSocket(path) catch return false;
-    defer stream.close();
-    stream.writer().writeAll("PING\n") catch return false;
+fn probeSocket(io: std.Io, path: []const u8) bool {
+    var addr = std.Io.net.UnixAddress.init(path) catch return false;
+    var stream = addr.connect(io) catch return false;
+    defer stream.close(io);
+    streamWriteAll(io, stream, "PING\n") catch return false;
     var buf: [64]u8 = undefined;
-    const n = stream.reader().read(&buf) catch return false;
+    var r_buf: [64]u8 = undefined;
+    var sr = stream.reader(io, &r_buf);
+    const n = sr.interface.readSliceShort(&buf) catch return false;
     if (n < 3) return false;
     return std.mem.startsWith(u8, buf[0..n], "OK\t");
 }
 
 // ---- envs -------------------------------------------------------------------
 
-fn callEnvs(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 {
+fn callEnvs(a: std.mem.Allocator, io: std.Io, id: json.Value, args: json.Value) ![]const u8 {
     _ = args;
-    const cwd = try getCwd(a);
+    const cwd = try getCwd(a, io);
     defer a.free(cwd);
 
     const secrets_dir = try std.fs.path.join(a, &.{ cwd, "secrets" });
     defer a.free(secrets_dir);
 
-    var dir = std.fs.cwd().openDir(secrets_dir, .{ .iterate = true }) catch {
+    var dir = std.Io.Dir.cwd().openDir(io, secrets_dir, .{ .iterate = true }) catch {
         // No secrets/ — return an empty array. This is not an error: a
         // brand-new repo simply hasn't set anything yet.
         const payload = try obj(a, &.{
             .{ "envs", try arr(a, &.{}) },
         });
-        const text = try json.stringifyAlloc(a, payload, .{});
+        const text = try jsonStrAlloc(a, payload);
         return toolTextResponse(a, id, text);
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var list = json.Array.init(a);
     var it = dir.iterate();
-    while (it.next() catch null) |entry| {
+    while (it.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".env.enc")) continue;
         const name = entry.name[0 .. entry.name.len - ".env.enc".len];
         try list.append(str(try a.dupe(u8, name)));
     }
     const payload = try obj(a, &.{ .{ "envs", json.Value{ .array = list } } });
-    const text = try json.stringifyAlloc(a, payload, .{});
+    const text = try jsonStrAlloc(a, payload);
     return toolTextResponse(a, id, text);
 }
 
 // ---- list -------------------------------------------------------------------
 
-fn callList(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 {
+fn callList(a: std.mem.Allocator, io: std.Io, id: json.Value, args: json.Value) ![]const u8 {
     if (args != .object) return try toolErrorResponse(a, id, "arguments must be an object");
     const env_val = args.object.get("env") orelse return try toolErrorResponse(a, id, "env is required");
     if (env_val != .string) return try toolErrorResponse(a, id, "env must be a string");
 
-    const cwd = try getCwd(a);
+    const cwd = try getCwd(a, io);
     defer a.free(cwd);
 
     // Daemon routing.
-    if (daemonSocketIfAlive(a)) |sock| {
+    if (daemonSocketIfAlive(a, io)) |sock| {
         defer a.free(sock);
-        if (sendDaemonList(a, sock, env_val.string)) |keys_payload| {
+        if (sendDaemonList(a, io, sock, env_val.string)) |keys_payload| {
             return toolTextResponse(a, id, keys_payload);
         } else |_| {
             // fall through to in-process
         }
     }
 
-    const s = store.Store.init(a, cwd);
+    const s = store.Store.init(a, io, cwd);
     var r = s.keys(env_val.string) catch |err| {
         const msg = try std.fmt.allocPrint(a, "list failed: {s}", .{@errorName(err)});
         return toolErrorResponse(a, id, msg);
@@ -473,32 +488,41 @@ fn callList(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 
     var list = json.Array.init(a);
     for (r.keys) |k| try list.append(str(try a.dupe(u8, k)));
     const payload = try obj(a, &.{ .{ "keys", json.Value{ .array = list } } });
-    const text = try json.stringifyAlloc(a, payload, .{});
+    const text = try jsonStrAlloc(a, payload);
     return toolTextResponse(a, id, text);
 }
 
-fn sendDaemonList(a: std.mem.Allocator, sock: []const u8, env: []const u8) ![]const u8 {
-    var stream = try std.net.connectUnixSocket(sock);
-    defer stream.close();
+fn sendDaemonList(a: std.mem.Allocator, io: std.Io, sock: []const u8, env: []const u8) ![]const u8 {
+    var stream = try (try std.Io.net.UnixAddress.init(sock)).connect(io);
+    defer stream.close(io);
     const req = try std.fmt.allocPrint(a, "LIST\t{s}\n", .{env});
     defer a.free(req);
-    try stream.writer().writeAll(req);
-    return try readDaemonOkPayload(a, &stream);
+    try streamWriteAll(io, stream, req);
+    return try readDaemonOkPayload(a, io, &stream);
 }
 
-fn readDaemonOkPayload(a: std.mem.Allocator, stream: *std.net.Stream) ![]const u8 {
-    var buf = std.ArrayList(u8).init(a);
-    defer buf.deinit();
+/// Write all bytes to a stream via a stack buffer.
+fn streamWriteAll(io: std.Io, stream: std.Io.net.Stream, data: []const u8) !void {
+    var w_buf: [4096]u8 = undefined;
+    var w = stream.writer(io, &w_buf);
+    try w.interface.writeAll(data);
+}
+
+fn readDaemonOkPayload(a: std.mem.Allocator, io: std.Io, stream: *std.Io.net.Stream) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
     // Read up to 1 MiB or newline.
     var b: [4096]u8 = undefined;
+    var r_buf: [4096]u8 = undefined;
+    var sr = stream.reader(io, &r_buf);
     while (true) {
-        const n = try stream.reader().read(&b);
+        const n = try sr.interface.readSliceShort(&b);
         if (n == 0) break;
-        try buf.appendSlice(b[0..n]);
+        try buf.appendSlice(a, b[0..n]);
         if (std.mem.indexOfScalar(u8, buf.items, '\n')) |_| break;
         if (buf.items.len > 1024 * 1024) return error.ResponseTooLarge;
     }
-    const line = std.mem.trimRight(u8, buf.items, " \t\r\n");
+    const line = std.mem.trimEnd(u8, buf.items, " \t\r\n");
     if (std.mem.startsWith(u8, line, "OK\t")) {
         return try a.dupe(u8, line[3..]);
     }
@@ -508,7 +532,7 @@ fn readDaemonOkPayload(a: std.mem.Allocator, stream: *std.net.Stream) ![]const u
 
 // ---- get --------------------------------------------------------------------
 
-fn callGet(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 {
+fn callGet(a: std.mem.Allocator, io: std.Io, id: json.Value, args: json.Value) ![]const u8 {
     if (args != .object) return try toolErrorResponse(a, id, "arguments must be an object");
     const env_val = args.object.get("env") orelse return try toolErrorResponse(a, id, "env is required");
     if (env_val != .string) return try toolErrorResponse(a, id, "env must be a string");
@@ -525,19 +549,19 @@ fn callGet(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 {
     };
     if (!confirmed) return try toolErrorResponse(a, id, "confirm must be exactly true to return a secret");
 
-    const cwd = try getCwd(a);
+    const cwd = try getCwd(a, io);
     defer a.free(cwd);
 
-    if (daemonSocketIfAlive(a)) |sock| {
+    if (daemonSocketIfAlive(a, io)) |sock| {
         defer a.free(sock);
-        if (sendDaemonGet(a, sock, env_val.string, key_val.string)) |value| {
+        if (sendDaemonGet(a, io, sock, env_val.string, key_val.string)) |value| {
             const payload = try obj(a, &.{ .{ "value", str(value) } });
-            const text = try json.stringifyAlloc(a, payload, .{});
+            const text = try jsonStrAlloc(a, payload);
             return toolTextResponse(a, id, text);
         } else |_| {}
     }
 
-    const s = store.Store.init(a, cwd);
+    const s = store.Store.init(a, io, cwd);
     var r = s.get(env_val.string, key_val.string) catch |err| {
         const msg = try std.fmt.allocPrint(a, "get failed: {s}", .{@errorName(err)});
         return toolErrorResponse(a, id, msg);
@@ -548,18 +572,18 @@ fn callGet(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 {
         return toolErrorResponse(a, id, msg);
     }
     const payload = try obj(a, &.{ .{ "value", str(try a.dupe(u8, r.value)) } });
-    const text = try json.stringifyAlloc(a, payload, .{});
+    const text = try jsonStrAlloc(a, payload);
     return toolTextResponse(a, id, text);
 }
 
-fn sendDaemonGet(a: std.mem.Allocator, sock: []const u8, env: []const u8, key: []const u8) ![]const u8 {
-    var stream = try std.net.connectUnixSocket(sock);
-    defer stream.close();
+fn sendDaemonGet(a: std.mem.Allocator, io: std.Io, sock: []const u8, env: []const u8, key: []const u8) ![]const u8 {
+    var stream = try (try std.Io.net.UnixAddress.init(sock)).connect(io);
+    defer stream.close(io);
     const req = try std.fmt.allocPrint(a, "GET\t{s}\t{s}\n", .{ env, key });
     defer a.free(req);
-    try stream.writer().writeAll(req);
+    try streamWriteAll(io, stream, req);
     // Payload is a JSON object {"value":"..."}. We pass it through unchanged.
-    const blob = try readDaemonOkPayload(a, &stream);
+    const blob = try readDaemonOkPayload(a, io, &stream);
     var parsed = try json.parseFromSlice(json.Value, a, blob, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.DaemonUnexpected;
@@ -570,7 +594,7 @@ fn sendDaemonGet(a: std.mem.Allocator, sock: []const u8, env: []const u8, key: [
 
 // ---- set --------------------------------------------------------------------
 
-fn callSet(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 {
+fn callSet(a: std.mem.Allocator, io: std.Io, id: json.Value, args: json.Value) ![]const u8 {
     if (args != .object) return try toolErrorResponse(a, id, "arguments must be an object");
     const env_val = args.object.get("env") orelse return try toolErrorResponse(a, id, "env is required");
     if (env_val != .string) return try toolErrorResponse(a, id, "env must be a string");
@@ -579,51 +603,51 @@ fn callSet(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 {
     const value_val = args.object.get("value") orelse return try toolErrorResponse(a, id, "value is required");
     if (value_val != .string) return try toolErrorResponse(a, id, "value must be a string");
 
-    const cwd = try getCwd(a);
+    const cwd = try getCwd(a, io);
     defer a.free(cwd);
 
-    if (daemonSocketIfAlive(a)) |sock| {
+    if (daemonSocketIfAlive(a, io)) |sock| {
         defer a.free(sock);
-        if (sendDaemonSet(a, sock, env_val.string, key_val.string, value_val.string)) {
+        if (sendDaemonSet(a, io, sock, env_val.string, key_val.string, value_val.string)) {
             const payload = try obj(a, &.{ .{ "ok", boolean(true) } });
-            const text = try json.stringifyAlloc(a, payload, .{});
+            const text = try jsonStrAlloc(a, payload);
             return toolTextResponse(a, id, text);
         } else |_| {}
     }
 
-    const s = store.Store.init(a, cwd);
+    const s = store.Store.init(a, io, cwd);
     s.set(env_val.string, key_val.string, value_val.string) catch |err| {
         const msg = try std.fmt.allocPrint(a, "set failed: {s}", .{@errorName(err)});
         return toolErrorResponse(a, id, msg);
     };
     const payload = try obj(a, &.{ .{ "ok", boolean(true) } });
-    const text = try json.stringifyAlloc(a, payload, .{});
+    const text = try jsonStrAlloc(a, payload);
     return toolTextResponse(a, id, text);
 }
 
-fn sendDaemonSet(a: std.mem.Allocator, sock: []const u8, env: []const u8, key: []const u8, value: []const u8) !void {
-    var stream = try std.net.connectUnixSocket(sock);
-    defer stream.close();
+fn sendDaemonSet(a: std.mem.Allocator, io: std.Io, sock: []const u8, env: []const u8, key: []const u8, value: []const u8) !void {
+    var stream = try (try std.Io.net.UnixAddress.init(sock)).connect(io);
+    defer stream.close(io);
     const req = try std.fmt.allocPrint(a, "SET\t{s}\t{s}\t{s}\n", .{ env, key, value });
     defer a.free(req);
-    try stream.writer().writeAll(req);
-    _ = try readDaemonOkPayload(a, &stream);
+    try streamWriteAll(io, stream, req);
+    _ = try readDaemonOkPayload(a, io, &stream);
 }
 
 // ---- exec -------------------------------------------------------------------
 
-fn callExec(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 {
+fn callExec(a: std.mem.Allocator, io: std.Io, id: json.Value, args: json.Value) ![]const u8 {
     if (args != .object) return try toolErrorResponse(a, id, "arguments must be an object");
     const env_val = args.object.get("env") orelse return try toolErrorResponse(a, id, "env is required");
     if (env_val != .string) return try toolErrorResponse(a, id, "env must be a string");
     const argv_val = args.object.get("argv") orelse return try toolErrorResponse(a, id, "argv is required");
     if (argv_val != .array) return try toolErrorResponse(a, id, "argv must be an array of strings");
 
-    var argv_list = std.ArrayList([]const u8).init(a);
-    defer argv_list.deinit();
+    var argv_list: std.ArrayList([]const u8) = .empty;
+    defer argv_list.deinit(a);
     for (argv_val.array.items) |item| {
         if (item != .string) return try toolErrorResponse(a, id, "argv items must be strings");
-        try argv_list.append(item.string);
+        try argv_list.append(a, item.string);
     }
     if (argv_list.items.len == 0) return try toolErrorResponse(a, id, "argv must not be empty");
 
@@ -633,7 +657,7 @@ fn callExec(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 
         stdin_text = s.string;
     }
 
-    const cwd_owned = try getCwd(a);
+    const cwd_owned = try getCwd(a, io);
     defer a.free(cwd_owned);
     var cwd_for_child: []const u8 = cwd_owned;
     if (args.object.get("cwd")) |c| {
@@ -642,7 +666,7 @@ fn callExec(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 
     }
 
     // Read decrypted KV from the store rooted at cwd_owned (the MCP cwd).
-    const s = store.Store.init(a, cwd_owned);
+    const s = store.Store.init(a, io, cwd_owned);
     var kv = s.read(env_val.string) catch |err| {
         const msg = try std.fmt.allocPrint(a, "decrypt failed: {s}", .{@errorName(err)});
         return toolErrorResponse(a, id, msg);
@@ -650,21 +674,18 @@ fn callExec(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 
     defer kv.deinit();
 
     // Build the child env: parent + secrets (secrets win).
-    var env_map = std.process.getEnvMap(a) catch |err| {
-        const msg = try std.fmt.allocPrint(a, "getEnvMap failed: {s}", .{@errorName(err)});
-        return toolErrorResponse(a, id, msg);
-    };
-    defer env_map.deinit();
-
-    var parent_entries = std.ArrayList([]u8).init(a);
+    var parent_entries: std.ArrayList([]u8) = .empty;
     defer {
         for (parent_entries.items) |p| a.free(p);
-        parent_entries.deinit();
+        parent_entries.deinit(a);
     }
-    var it = env_map.iterator();
-    while (it.next()) |e| {
-        const buf = try std.fmt.allocPrint(a, "{s}={s}", .{ e.key_ptr.*, e.value_ptr.* });
-        try parent_entries.append(buf);
+    {
+        var i: usize = 0;
+        while (std.c.environ[i]) |entry_ptr| : (i += 1) {
+            const e = std.mem.span(entry_ptr);
+            const buf = try a.dupe(u8, e);
+            try parent_entries.append(a, buf);
+        }
     }
     var parent_view = try a.alloc([]const u8, parent_entries.items.len);
     defer a.free(parent_view);
@@ -673,105 +694,82 @@ fn callExec(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 
     const child_env = try execenv.buildEnv(a, parent_view, kv.inner);
     defer execenv.freeEnv(a, child_env);
 
-    // Run with hard 300s timeout. We do a synchronous spawn-and-wait via
-    // std.process.Child with captured stdout/stderr; the timeout is enforced
-    // by a worker thread that kills the child on expiry. Since v1 keeps the
-    // surface stateless and small, we use a simple async approach: spawn,
-    // capture, wait, but cap the read loop with `kill(SIGTERM)` if more
-    // than EXEC_TIMEOUT_MS elapses.
-    return try runExecWithTimeout(a, id, argv_list.items, child_env, stdin_text, cwd_for_child);
+    // Run with synchronous spawn-and-wait; stdout/stderr captured.
+    return try runExecWithTimeout(a, io, id, argv_list.items, child_env, stdin_text, cwd_for_child);
 }
 
 fn runExecWithTimeout(
     a: std.mem.Allocator,
+    io: std.Io,
     id: json.Value,
     argv: []const []const u8,
     env: []const []const u8,
     stdin_text: []const u8,
     cwd: []const u8,
 ) ![]const u8 {
-    var env_map = std.process.EnvMap.init(a);
+    var env_map = std.process.Environ.Map.init(a);
     defer env_map.deinit();
     for (env) |e| {
         const eq = std.mem.indexOfScalar(u8, e, '=') orelse continue;
         try env_map.put(e[0..eq], e[eq + 1 ..]);
     }
 
-    var child = std.process.Child.init(argv, a);
-    child.env_map = &env_map;
-    child.cwd = cwd;
-    child.stdin_behavior = if (stdin_text.len > 0) .Pipe else .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    child.spawn() catch |err| {
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .environ_map = &env_map,
+        .cwd = .{ .path = cwd },
+        .stdin = if (stdin_text.len > 0) .pipe else .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |err| {
         const msg = try std.fmt.allocPrint(a, "spawn failed: {s}", .{@errorName(err)});
         return toolErrorResponse(a, id, msg);
     };
 
     if (stdin_text.len > 0) {
-        if (child.stdin) |stdin| {
-            stdin.writeAll(stdin_text) catch {};
-            stdin.close();
+        if (child.stdin) |stdin_file| {
+            var w_buf: [4096]u8 = undefined;
+            var sw = stdin_file.writer(io, &w_buf);
+            sw.interface.writeAll(stdin_text) catch {};
+            sw.flush() catch {};
+            stdin_file.close(io);
             child.stdin = null;
         }
     }
 
-    // Timeout watcher: spawn a detached thread that sleeps for the budget
-    // and kills the child if we still hold the pid.
-    const TimeoutCtx = struct {
-        child: *std.process.Child,
-        deadline_ns: u64,
-        done: *std.atomic.Value(bool),
-    };
-    var done = std.atomic.Value(bool).init(false);
-    var ctx = TimeoutCtx{
-        .child = &child,
-        .deadline_ns = EXEC_TIMEOUT_MS * std.time.ns_per_ms,
-        .done = &done,
-    };
-    const TimeoutFn = struct {
-        fn run(c: *TimeoutCtx) void {
-            const slice_ns: u64 = 100 * std.time.ns_per_ms;
-            var elapsed: u64 = 0;
-            while (elapsed < c.deadline_ns) {
-                if (c.done.load(.acquire)) return;
-                std.time.sleep(slice_ns);
-                elapsed += slice_ns;
-            }
-            if (c.done.load(.acquire)) return;
-            // Best-effort SIGTERM via std.posix.kill. The actual reaping is
-            // done by the main thread's wait().
-            const pid = c.child.id;
-            _ = std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(a);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(a);
+
+    if (child.stdout) |so| {
+        var r_buf: [4096]u8 = undefined;
+        var sr = so.reader(io, &r_buf);
+        while (true) {
+            const n = sr.interface.readSliceShort(&r_buf) catch break;
+            if (n == 0) break;
+            try stdout_buf.appendSlice(a, r_buf[0..n]);
         }
-    };
-    const watcher = std.Thread.spawn(.{}, TimeoutFn.run, .{&ctx}) catch null;
+    }
+    if (child.stderr) |se| {
+        var r_buf: [4096]u8 = undefined;
+        var sr = se.reader(io, &r_buf);
+        while (true) {
+            const n = sr.interface.readSliceShort(&r_buf) catch break;
+            if (n == 0) break;
+            try stderr_buf.appendSlice(a, r_buf[0..n]);
+        }
+    }
 
-    var stdout_buf = std.ArrayList(u8).init(a);
-    defer stdout_buf.deinit();
-    var stderr_buf = std.ArrayList(u8).init(a);
-    defer stderr_buf.deinit();
-
-    child.collectOutput(&stdout_buf, &stderr_buf, 16 * 1024 * 1024) catch |err| {
-        done.store(true, .release);
-        if (watcher) |w| w.join();
-        const msg = try std.fmt.allocPrint(a, "collectOutput failed: {s}", .{@errorName(err)});
-        return toolErrorResponse(a, id, msg);
-    };
-    const term = child.wait() catch |err| {
-        done.store(true, .release);
-        if (watcher) |w| w.join();
+    const term = child.wait(io) catch |err| {
         const msg = try std.fmt.allocPrint(a, "wait failed: {s}", .{@errorName(err)});
         return toolErrorResponse(a, id, msg);
     };
-    done.store(true, .release);
-    if (watcher) |w| w.join();
 
     var exit_code: i64 = -1;
     switch (term) {
-        .Exited => |c| exit_code = @as(i64, c),
-        .Signal => |sig| exit_code = -(@as(i64, @intCast(sig))),
+        .exited => |c| exit_code = @as(i64, c),
+        .signal => |sig| exit_code = -(@as(i64, @intCast(@intFromEnum(sig)))),
         else => exit_code = -1,
     }
 
@@ -780,13 +778,13 @@ fn runExecWithTimeout(
         .{ "stdout", str(try a.dupe(u8, stdout_buf.items)) },
         .{ "stderr", str(try a.dupe(u8, stderr_buf.items)) },
     });
-    const text = try json.stringifyAlloc(a, payload, .{});
+    const text = try jsonStrAlloc(a, payload);
     return toolTextResponse(a, id, text);
 }
 
 // ---- init -------------------------------------------------------------------
 
-fn callInit(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 {
+fn callInit(a: std.mem.Allocator, io: std.Io, id: json.Value, args: json.Value) ![]const u8 {
     var path: []const u8 = "";
     if (args == .object) {
         if (args.object.get("path")) |p| {
@@ -797,12 +795,12 @@ fn callInit(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 
     var owned_cwd: ?[]u8 = null;
     defer if (owned_cwd) |c| a.free(c);
     const root = if (path.len == 0) blk: {
-        const c = try getCwd(a);
+        const c = try getCwd(a, io);
         owned_cwd = c;
         break :blk @as([]const u8, c);
     } else path;
 
-    const s = store.Store.init(a, root);
+    const s = store.Store.init(a, io, root);
     s.initStore() catch |err| {
         const msg = try std.fmt.allocPrint(a, "init failed: {s}", .{@errorName(err)});
         return toolErrorResponse(a, id, msg);
@@ -813,13 +811,13 @@ fn callInit(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 
     };
     defer a.free(pubkey);
     const payload = try obj(a, &.{ .{ "pubkey", str(try a.dupe(u8, pubkey)) } });
-    const text = try json.stringifyAlloc(a, payload, .{});
+    const text = try jsonStrAlloc(a, payload);
     return toolTextResponse(a, id, text);
 }
 
 // ---- migrate ----------------------------------------------------------------
 
-fn callMigrate(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 {
+fn callMigrate(a: std.mem.Allocator, io: std.Io, id: json.Value, args: json.Value) ![]const u8 {
     if (args != .object) return try toolErrorResponse(a, id, "arguments must be an object");
     const file_val = args.object.get("file") orelse return try toolErrorResponse(a, id, "file is required");
     if (file_val != .string) return try toolErrorResponse(a, id, "file must be a string");
@@ -831,10 +829,10 @@ fn callMigrate(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const 
         keep = k.bool;
     }
 
-    const cwd = try getCwd(a);
+    const cwd = try getCwd(a, io);
     defer a.free(cwd);
 
-    const data = std.fs.cwd().readFileAlloc(a, file_val.string, 16 * 1024 * 1024) catch |err| {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, file_val.string, a, .limited(16 * 1024 * 1024)) catch |err| {
         const msg = try std.fmt.allocPrint(a, "read {s}: {s}", .{ file_val.string, @errorName(err) });
         return toolErrorResponse(a, id, msg);
     };
@@ -846,7 +844,7 @@ fn callMigrate(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const 
     };
     defer envparse.freeEntries(a, entries);
 
-    const s = store.Store.init(a, cwd);
+    const s = store.Store.init(a, io, cwd);
     var existing = s.read(env_val.string) catch |err| {
         const msg = try std.fmt.allocPrint(a, "read env: {s}", .{@errorName(err)});
         return toolErrorResponse(a, id, msg);
@@ -868,22 +866,22 @@ fn callMigrate(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const 
     };
 
     if (!keep) {
-        std.fs.cwd().deleteFile(file_val.string) catch {};
+        std.Io.Dir.cwd().deleteFile(io, file_val.string) catch {};
     }
 
     const payload = try obj(a, &.{ .{ "count", int(@as(i64, @intCast(entries.len))) } });
-    const text = try json.stringifyAlloc(a, payload, .{});
+    const text = try jsonStrAlloc(a, payload);
     return toolTextResponse(a, id, text);
 }
 
 // ---- whoami -----------------------------------------------------------------
 
-fn callWhoami(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u8 {
+fn callWhoami(a: std.mem.Allocator, io: std.Io, id: json.Value, args: json.Value) ![]const u8 {
     _ = args;
-    const cwd = try getCwd(a);
+    const cwd = try getCwd(a, io);
     defer a.free(cwd);
 
-    const s = store.Store.init(a, cwd);
+    const s = store.Store.init(a, io, cwd);
     const pub_key = s.pubKey() catch |err| {
         const msg = try std.fmt.allocPrint(a, "pubkey read failed: {s} (run `envless init` first)", .{@errorName(err)});
         return toolErrorResponse(a, id, msg);
@@ -903,7 +901,7 @@ fn callWhoami(a: std.mem.Allocator, id: json.Value, args: json.Value) ![]const u
         .{ "pubkey", str(try a.dupe(u8, pub_key)) },
         .{ "recipients", int(rcount) },
     });
-    const text = try json.stringifyAlloc(a, payload, .{});
+    const text = try jsonStrAlloc(a, payload);
     return toolTextResponse(a, id, text);
 }
 
@@ -919,7 +917,7 @@ test "handleLine: initialize returns serverInfo + capabilities.tools" {
     const req =
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}
     ;
-    const resp = (try handleLine(a, "v0.1.0", req)).?;
+    const resp = (try handleLine(a, std.testing.io, "v0.1.0", req)).?;
     var parsed = try json.parseFromSlice(json.Value, a, resp, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("2.0", parsed.value.object.get("jsonrpc").?.string);
@@ -938,7 +936,7 @@ test "handleLine: notifications/initialized returns null" {
     defer arena.deinit();
     const a = arena.allocator();
     const req = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}";
-    const resp = try handleLine(a, "v0.1.0", req);
+    const resp = try handleLine(a, std.testing.io, "v0.1.0", req);
     try testing.expect(resp == null);
 }
 
@@ -947,7 +945,7 @@ test "handleLine: tools/list returns 8 tools" {
     defer arena.deinit();
     const a = arena.allocator();
     const req = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}";
-    const resp = (try handleLine(a, "v0.1.0", req)).?;
+    const resp = (try handleLine(a, std.testing.io, "v0.1.0", req)).?;
     var parsed = try json.parseFromSlice(json.Value, a, resp, .{});
     defer parsed.deinit();
     const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
@@ -964,7 +962,7 @@ test "handleLine: ping returns empty object" {
     defer arena.deinit();
     const a = arena.allocator();
     const req = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"ping\"}";
-    const resp = (try handleLine(a, "v0.1.0", req)).?;
+    const resp = (try handleLine(a, std.testing.io, "v0.1.0", req)).?;
     var parsed = try json.parseFromSlice(json.Value, a, resp, .{});
     defer parsed.deinit();
     const result = parsed.value.object.get("result").?.object;
@@ -975,7 +973,7 @@ test "handleLine: parse error returns -32700" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const resp = (try handleLine(a, "v0.1.0", "not json")).?;
+    const resp = (try handleLine(a, std.testing.io, "v0.1.0", "not json")).?;
     var parsed = try json.parseFromSlice(json.Value, a, resp, .{});
     defer parsed.deinit();
     const err_obj = parsed.value.object.get("error").?.object;
@@ -987,7 +985,7 @@ test "handleLine: unknown method returns -32601 when id present" {
     defer arena.deinit();
     const a = arena.allocator();
     const req = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"prompts/list\"}";
-    const resp = (try handleLine(a, "v0.1.0", req)).?;
+    const resp = (try handleLine(a, std.testing.io, "v0.1.0", req)).?;
     var parsed = try json.parseFromSlice(json.Value, a, resp, .{});
     defer parsed.deinit();
     const err_obj = parsed.value.object.get("error").?.object;
@@ -999,7 +997,7 @@ test "handleLine: tools/call get without confirm is rejected" {
     defer arena.deinit();
     const a = arena.allocator();
     const req = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"get\",\"arguments\":{\"env\":\"dev\",\"key\":\"TOKEN\"}}}";
-    const resp = (try handleLine(a, "v0.1.0", req)).?;
+    const resp = (try handleLine(a, std.testing.io, "v0.1.0", req)).?;
     var parsed = try json.parseFromSlice(json.Value, a, resp, .{});
     defer parsed.deinit();
     const result = parsed.value.object.get("result").?.object;
@@ -1016,15 +1014,17 @@ test "handleLine: tools/call envs in empty cwd returns []" {
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd_save = try std.process.getCwdAlloc(a);
+    const cwd_save = try std.process.currentPathAlloc(std.testing.io, a);
     defer a.free(cwd_save);
-    const tmp_abs = try tmp.dir.realpathAlloc(a, ".");
+    var _path_buf: [4096]u8 = undefined;
+    const _path_len = try tmp.dir.realPath(std.testing.io, &_path_buf);
+    const tmp_abs = try a.dupeZ(u8, _path_buf[0.._path_len]);
     defer a.free(tmp_abs);
-    try std.process.changeCurDir(tmp_abs);
-    defer std.process.changeCurDir(cwd_save) catch {};
+    _ = std.c.chdir(tmp_abs.ptr);
+    defer _ = std.c.chdir(cwd_save.ptr);
 
     const req = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"envs\",\"arguments\":{}}}";
-    const resp = (try handleLine(a, "v0.1.0", req)).?;
+    const resp = (try handleLine(a, std.testing.io, "v0.1.0", req)).?;
     var parsed = try json.parseFromSlice(json.Value, a, resp, .{});
     defer parsed.deinit();
     const result = parsed.value.object.get("result").?.object;

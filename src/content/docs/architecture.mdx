@@ -4,9 +4,12 @@ description: Why .env breaks once agents and teams arrive, how envless replaces 
 ---
 
 `envless` is a thin orchestrator over two external binaries
-(`age-keygen` and `sops`) and the filesystem. There is no daemon, no
-cache, no in-memory state across invocations. Every command reads from
-disk, shells out, and exits.
+(`age-keygen` and `sops`) and the filesystem. The default mode is
+stateless: every command reads from disk, shells out, and exits. An
+**optional** daemon (`envless daemon`) provides an in-memory
+decrypt-cache for latency-sensitive workflows, and an MCP server
+(`envless mcp`) exposes the tool to AI agents via JSON-RPC 2.0 over
+stdio. Neither runs unless explicitly started.
 
 The whole point is to replace `.env` with something that survives
 multiple agents, multiple teammates, and shared logs — without growing
@@ -83,6 +86,8 @@ flowchart LR
   sops[sops binary]
   age[age-keygen binary]
   child[Child process<br/>process.env populated]
+  daemon[Daemon<br/>LRU cache, Unix socket]
+  mcp[MCP Server<br/>JSON-RPC over stdio]
 
   user -->|exec / set / get| cli
   cli -->|init| age
@@ -94,18 +99,28 @@ flowchart LR
   sops --> cli
   cli -->|fork + execve| child
   ident -. SOPS_AGE_KEY_FILE .-> sops
+  cli -.->|optional: cache miss| daemon
+  daemon -->|decrypt + cache| sops
+  user -->|tool calls| mcp
+  mcp -->|set / get / list| cli
 ```
 
 ## Components
 
 | Component | Role | Code |
 |---|---|---|
-| `zig/src/main.zig` | argv entry, version flag | 21 LOC |
-| `zig/src/cli/*.zig` | hand-rolled subcommand dispatcher (no cobra) | ~580 LOC |
-| `zig/src/store.zig` | filesystem layout, KV operations | 400 LOC |
-| `zig/src/sops.zig` | shells out to `sops`, dotenv roundtrip | 334 LOC |
-| `zig/src/execenv.zig` | builds env array, spawns child | 266 LOC |
+| `zig/src/main.zig` | argv entry, version flag | 24 LOC |
+| `zig/src/cli/*.zig` | hand-rolled subcommand dispatcher (no cobra) | ~1553 LOC |
+| `zig/src/store.zig` | filesystem layout, KV operations | 414 LOC |
+| `zig/src/sops.zig` | shells out to `sops`, dotenv roundtrip | 338 LOC |
+| `zig/src/execenv.zig` | builds env array, spawns child | 269 LOC |
 | `zig/src/envparse.zig` | parses `.env` (quotes + comments) | 157 LOC |
+| `zig/src/daemon.zig` | optional decrypt-cache daemon (Unix socket, LRU cache) | 712 LOC |
+| `zig/src/ipc.zig` | wire protocol for daemon ↔ client IPC | 378 LOC |
+| `zig/src/mcp.zig` | MCP server (JSON-RPC 2.0 over stdio) for agents | 1037 LOC |
+| `zig/src/backup.zig` | tar.gz backup of encrypted artefacts | 482 LOC |
+| `zig/src/launchd.zig` | macOS launchd supervisor integration | 351 LOC |
+| `zig/src/systemd.zig` | Linux systemd supervisor integration | 273 LOC |
 
 Single static binary at `zig-out/bin/envless` (~150 KB stripped on
 aarch64-linux, ReleaseSmall). No runtime, no GC; one dependency
@@ -140,6 +155,48 @@ surface is whatever trust you already place in `age` and `sops` — both
 well-audited and narrowly scoped. See
 [Security → Cryptography](/envless/security/#cryptography-age--sops)
 for the formal primitives.
+
+## Optional: Daemon mode
+
+The daemon (`zig/src/daemon.zig`) is an **opt-in** process that caches
+decrypted env maps in memory for up to 60 seconds per `(repo, env)`
+pair, using an LRU eviction policy. It listens on a Unix domain socket
+whose path is resolved via `XDG_RUNTIME_DIR` or `~/.cache/envless/sock`.
+
+When the daemon is running, `envless exec` and `envless get` check the
+socket first. On a cache hit, the sops decrypt is skipped entirely —
+latency drops from ~200 ms (sops spawn + decrypt) to sub-millisecond
+(socket round-trip). On a cache miss, the daemon decrypts, caches, and
+returns.
+
+The wire protocol (`zig/src/ipc.zig`) is line-oriented JSON over the
+Unix socket: one JSON request per line, one JSON response per line.
+Requests larger than 1 MB are rejected with an `err` response to
+prevent unbounded memory growth.
+
+Daemon supervision is platform-specific:
+- **macOS**: `zig/src/launchd.zig` generates a `~/Library/LaunchAgents/envless.plist`
+- **Linux**: `zig/src/systemd.zig` generates a `~/.config/systemd/user/envless.service`
+
+Neither is installed by default. `envless daemon install` creates the
+unit file and enables it; `envless daemon uninstall` removes it.
+
+See [Security → What envless does NOT protect against](/envless/security/#what-envless-does-not-protect-against)
+for the threat-model implications of resident plaintext.
+
+## Optional: MCP server
+
+The MCP server (`zig/src/mcp.zig`) exposes envless to AI agents via
+[Model Context Protocol](https://modelcontextprotocol.io/) (JSON-RPC 2.0
+over stdio). It allows agents to call `set`, `get`, `list`, `migrate`,
+`envs`, `whoami`, and `exec` as structured tool calls without shelling
+out to the CLI.
+
+The server is rooted at the cwd of the process that launched it —
+typically the Claude Code (or other MCP client) session directory. One
+envless repo per MCP server instance. The `init` tool accepts an
+explicit `path` argument for bootstrapping; all other tools resolve
+`.envless/` from the MCP process cwd.
 
 ## Lifecycle of a secret
 
@@ -240,7 +297,8 @@ treated as the oracle for behavior.
 - Replace a real KMS for cloud-native deploys. If you have AWS KMS,
   use it.
 - Be a password manager. 1Password, Bitwarden, etc. own that surface.
-- Run a server. There is no server. There will never be a server.
+- Run a always-on server. The daemon is opt-in and ephemeral; the
+  default mode is stateless CLI invocations.
 - Have a free tier and a paid tier. There is no tier. It's a binary.
 
 See [Why envless → When NOT to use](/envless/why/#when-not-to-use)

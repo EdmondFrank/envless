@@ -11,3 +11,4 @@ coverage.out
 .research/repos/
 node_modules/
 .DS_Store
+.aider*

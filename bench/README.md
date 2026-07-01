@@ -66,7 +66,7 @@ The JSON shape (`schema_version: 1`):
   "git_sha": "…",
   "timestamp": "2026-…Z",
   "platform":  { "os": "Linux", "arch": "aarch64" },
-  "toolchain_versions": { "zig": "0.13.0", "hyperfine": "1.18.0" },
+  "toolchain_versions": { "zig": "0.16.0", "hyperfine": "1.18.0" },
   "toolchains": [
     {
       "label": "zig",

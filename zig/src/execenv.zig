@@ -20,8 +20,7 @@ pub const RunResult = union(enum) {
 pub const RunError = error{
     EmptyArgv,
     Signaled,
-    LaunchFailed,
-} || std.process.Child.SpawnError || std.mem.Allocator.Error;
+} || std.process.SpawnError || std.process.Child.WaitError || std.mem.Allocator.Error;
 
 /// buildEnv merges the parent env (e.g. from std.process.getEnvMap) with kv,
 /// where kv keys override parent keys, returns a sorted []const u8 slice of
@@ -84,42 +83,42 @@ pub fn freeEnv(allocator: std.mem.Allocator, env: [][]const u8) void {
 }
 
 /// run executes argv with the given env. argv[0] is resolved via PATH (handled
-/// by std.process.Child). Returns .non_zero with the exit code, or .success.
+/// by std.process.spawn). Returns .non_zero with the exit code, or .success.
 /// May return RunError on launch/setup failure.
 ///
 /// stdin/stdout/stderr handling: nulls mean Ignore (closes the fd). Pass the
-/// caller's std.fs.File to inherit.
+/// caller's std.Io.File to inherit.
 pub fn run(
     allocator: std.mem.Allocator,
+    io: std.Io,
     argv: []const []const u8,
     env: []const []const u8,
-    stdin: ?std.fs.File,
-    stdout: ?std.fs.File,
-    stderr: ?std.fs.File,
+    stdin: ?std.Io.File,
+    stdout: ?std.Io.File,
+    stderr: ?std.Io.File,
 ) RunError!RunResult {
     if (argv.len == 0) return RunError.EmptyArgv;
 
-    // std.process.Child wants *EnvMap, not []const u8 entries. Materialize one.
-    var env_map = std.process.EnvMap.init(allocator);
+    // Build an Environ.Map from the env entries.
+    var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
     for (env) |e| {
         const eq = std.mem.indexOfScalar(u8, e, '=') orelse continue;
         try env_map.put(e[0..eq], e[eq + 1 ..]);
     }
 
-    var child = std.process.Child.init(argv, allocator);
-    child.env_map = &env_map;
-    child.stdin_behavior = if (stdin != null) .Inherit else .Ignore;
-    child.stdout_behavior = if (stdout != null) .Inherit else .Ignore;
-    child.stderr_behavior = if (stderr != null) .Inherit else .Ignore;
-    // If a specific file is provided, hook it up. Inherit picks fd 0/1/2 of
-    // the parent process, which is what callers want when they pass the
-    // process's std{in,out,err} files.
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .environ_map = &env_map,
+        .stdin = if (stdin != null) .inherit else .ignore,
+        .stdout = if (stdout != null) .inherit else .ignore,
+        .stderr = if (stderr != null) .inherit else .ignore,
+    });
 
-    const term = try child.spawnAndWait();
+    const term = try child.wait(io);
     return switch (term) {
-        .Exited => |code| if (code == 0) .success else .{ .non_zero = code },
-        .Signal, .Stopped, .Unknown => RunError.Signaled,
+        .exited => |code| if (code == 0) .success else .{ .non_zero = code },
+        .signal, .stopped, .unknown => RunError.Signaled,
     };
 }
 
@@ -207,7 +206,9 @@ test "run injects env into child" {
     // Write to a temp file so we can read what the child produced.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const out_path = try tmp.dir.realpathAlloc(a, ".");
+    var _path_buf: [4096]u8 = undefined;
+    const _path_len = try tmp.dir.realPath(std.testing.io, &_path_buf);
+    const out_path = try a.dupe(u8, _path_buf[0.._path_len]);
     defer a.free(out_path);
     const out_file_path = try std.fs.path.join(a, &.{ out_path, "out.txt" });
     defer a.free(out_file_path);
@@ -217,10 +218,10 @@ test "run injects env into child" {
     defer a.free(script);
     const argv = [_][]const u8{ "sh", "-c", script };
 
-    const res = try run(a, &argv, env, null, null, null);
+    const res = try run(a, std.testing.io, &argv, env, null, null, null);
     try testing.expectEqual(RunResult.success, res);
 
-    const data = try tmp.dir.readFileAlloc(a, "out.txt", 1024);
+    const data = try tmp.dir.readFileAlloc(std.testing.io, "out.txt", a, .limited(1024));
     defer a.free(data);
     try testing.expectEqualStrings("hello\n", data);
 }
@@ -229,7 +230,9 @@ test "run does not leak parent env vars not in env arg" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_real = try tmp.dir.realpathAlloc(a, ".");
+    var _path_buf: [4096]u8 = undefined;
+    const _path_len = try tmp.dir.realPath(std.testing.io, &_path_buf);
+    const tmp_real = try a.dupe(u8, _path_buf[0.._path_len]);
     defer a.free(tmp_real);
     const out_file_path = try std.fs.path.join(a, &.{ tmp_real, "env.txt" });
     defer a.free(out_file_path);
@@ -239,10 +242,10 @@ test "run does not leak parent env vars not in env arg" {
     defer a.free(script);
     const argv = [_][]const u8{ "/bin/sh", "-c", script };
 
-    const res = try run(a, &argv, &env_arr, null, null, null);
+    const res = try run(a, std.testing.io, &argv, &env_arr, null, null, null);
     try testing.expectEqual(RunResult.success, res);
 
-    const data = try tmp.dir.readFileAlloc(a, "env.txt", 64 * 1024);
+    const data = try tmp.dir.readFileAlloc(std.testing.io, "env.txt", a, .limited(64 * 1024));
     defer a.free(data);
 
     if (std.mem.indexOf(u8, data, "ENVLESS_TEST=only") == null) {
@@ -258,7 +261,7 @@ test "run does not leak parent env vars not in env arg" {
 test "run propagates exit code" {
     const a = testing.allocator;
     const argv = [_][]const u8{ "sh", "-c", "exit 7" };
-    const res = try run(a, &argv, &.{}, null, null, null);
+    const res = try run(a, std.testing.io, &argv, &.{}, null, null, null);
     switch (res) {
         .non_zero => |code| try testing.expectEqual(@as(u8, 7), code),
         .success => return error.TestExpectedNonZero,

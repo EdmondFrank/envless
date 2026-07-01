@@ -19,7 +19,7 @@ from source (see below).
 ## Quickstart
 
 ```bash
-# build from source (needs Zig 0.13.0)
+# build from source (needs Zig 0.16.0)
 cd zig && zig build -Doptimize=ReleaseSmall
 
 # in any project
@@ -59,25 +59,31 @@ envless migrate .env       # encrypts → secrets/dev.env.enc, removes .env, add
 
 - `age` >= 1.2 (`brew install age`)
 - `sops` >= 3.9 (`brew install sops`)
-- Zig 0.13.0 (build only) — pinned in `zig/.zigversion`
+- Zig 0.16.0 (build only) — pinned in `zig/.zigversion`
 
 ## Architecture
 
 - `zig/src/main.zig` — entrypoint
 - `zig/src/cli/` — subcommand dispatcher (no cobra; hand-rolled)
 - `zig/src/store.zig` — file layout (.envless/, secrets/)
-- `zig/src/sops.zig` — sops binary wrapper
+- `zig/src/sops.zig` — sops binary wrapper (encrypt/decrypt)
 - `zig/src/execenv.zig` — env array build + child exec
 - `zig/src/envparse.zig` — .env parser
+- `zig/src/daemon.zig` — optional in-memory decrypt-cache daemon (Unix socket)
+- `zig/src/ipc.zig` — wire protocol for daemon ↔ client communication
+- `zig/src/mcp.zig` — MCP server (JSON-RPC 2.0 over stdio) for agents
+- `zig/src/backup.zig` — tar.gz backup of encrypted artefacts
+- `zig/src/launchd.zig` / `zig/src/systemd.zig` — daemon supervisor integration
 
 Single Zig binary, no runtime deps, ~150 KB stripped. Apache-2.0.
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full design doc.
 
 ## Tests
 
 ```bash
 cd zig
-zig build test     # 37 inline unit tests
-zig build e2e      # 6 end-to-end tests against the built binary
+zig build test     # 75 inline unit tests
+zig build e2e      # 18 end-to-end tests against the built binary
 ```
 
 ## Release
