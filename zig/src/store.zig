@@ -59,9 +59,8 @@ pub const Store = struct {
         const a = self.allocator;
         const dir = std.fs.path.join(a, &.{ self.root, ".envless" }) catch return Error.OutOfMemory;
         defer a.free(dir);
-        std.Io.Dir.cwd().createDirPath(self.io, dir) catch return Error.MkdirFailed;
-        // chmod 0700 on the directory (Go uses MkdirAll(... 0o700)).
-        chmod(dir, 0o700) catch return Error.ChmodFailed;
+        // Create .envless/ (mode 0700). Handles symlinks — see ensureEnvlessDir.
+        try ensureEnvlessDir(a, self.io, dir);
 
         const id = self.identityPath(a) catch return Error.OutOfMemory;
         defer a.free(id);
@@ -270,6 +269,42 @@ fn chmod(path: []const u8, mode: u32) !void {
     if (rc != 0) return error.ChmodFailed;
 }
 
+/// ensureEnvlessDir creates the .envless directory with mode 0700, handling
+/// the case where .envless is a symlink to a (possibly non-existent) target.
+///
+/// When .envless is a broken symlink, createDirPath fails because the symlink
+/// itself is in the way — the target can't be created through it. We detect
+/// this, resolve the symlink target, create it directly, then chmod through
+/// the symlink path (which follows the link to the now-existing target).
+fn ensureEnvlessDir(allocator: std.mem.Allocator, io: std.Io, envless_path: []const u8) Error!void {
+    // Fast path: works when .envless doesn't exist or is a symlink to an
+    // existing directory.
+    if (std.Io.Dir.cwd().createDirPath(io, envless_path)) |_| {
+        chmod(envless_path, 0o700) catch return Error.ChmodFailed;
+        return;
+    } else |_| {}
+
+    // createDirPath failed — check if .envless is a broken symlink.
+    var link_buf: [4096]u8 = undefined;
+    const link_len = std.Io.Dir.cwd().readLink(io, envless_path, &link_buf) catch return Error.MkdirFailed;
+    const target = link_buf[0..link_len];
+
+    // Resolve the target: if relative, join with the parent of envless_path.
+    const resolved = if (std.fs.path.isAbsolute(target))
+        allocator.dupe(u8, target) catch return Error.OutOfMemory
+    else blk: {
+        const parent = std.fs.path.dirname(envless_path) orelse ".";
+        break :blk std.fs.path.join(allocator, &.{ parent, target }) catch return Error.OutOfMemory;
+    };
+    defer allocator.free(resolved);
+
+    // Create the target directory.
+    std.Io.Dir.cwd().createDirPath(io, resolved) catch return Error.MkdirFailed;
+
+    // chmod 0700 — follows symlinks, so it chmods the target.
+    chmod(envless_path, 0o700) catch return Error.ChmodFailed;
+}
+
 // ----------------------------- tests -----------------------------------------
 
 const testing = std.testing;
@@ -411,4 +446,96 @@ test "keys returns sorted key list with no values" {
     const want = [_][]const u8{ "A", "M", "Z" };
     try testing.expectEqual(want.len, r.keys.len);
     for (want, 0..) |w, i| try testing.expectEqualStrings(w, r.keys[i]);
+}
+
+test "initStore works when .envless is a symlink to an existing directory" {
+    if (!binAvailable(std.testing.io, "age-keygen")) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var _path_buf: [4096]u8 = undefined;
+    const _path_len = try tmp.dir.realPath(io, &_path_buf);
+    const root = try a.dupe(u8, _path_buf[0.._path_len]);
+    defer a.free(root);
+
+    // Create a target directory and symlink .envless → target.
+    const target_dir = try std.fs.path.join(a, &.{ root, "real-envless" });
+    defer a.free(target_dir);
+    try std.Io.Dir.createDirAbsolute(io, target_dir, .default_dir);
+
+    const link_path = try std.fs.path.join(a, &.{ root, ".envless" });
+    defer a.free(link_path);
+    try std.Io.Dir.symLinkAbsolute(io, target_dir, link_path, .{ .is_directory = true });
+
+    // initStore should detect the existing symlink target and succeed.
+    const s = Store.init(a, io, root);
+    try s.initStore();
+    const pub_key = try s.pubKey();
+    defer a.free(pub_key);
+    try testing.expectEqualStrings("age1", pub_key[0..4]);
+}
+
+test "initStore works when .envless is a broken symlink (target created)" {
+    if (!binAvailable(std.testing.io, "age-keygen")) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var _path_buf: [4096]u8 = undefined;
+    const _path_len = try tmp.dir.realPath(io, &_path_buf);
+    const root = try a.dupe(u8, _path_buf[0.._path_len]);
+    defer a.free(root);
+
+    // Create a broken symlink: .envless → real-envless (target doesn't exist).
+    const target_dir = try std.fs.path.join(a, &.{ root, "real-envless" });
+    defer a.free(target_dir);
+    const link_path = try std.fs.path.join(a, &.{ root, ".envless" });
+    defer a.free(link_path);
+    try std.Io.Dir.symLinkAbsolute(io, target_dir, link_path, .{ .is_directory = true });
+
+    // initStore should resolve the broken symlink, create the target, and succeed.
+    const s = Store.init(a, io, root);
+    try s.initStore();
+    const pub_key = try s.pubKey();
+    defer a.free(pub_key);
+    try testing.expectEqualStrings("age1", pub_key[0..4]);
+
+    // Verify identity.key was written through the symlink into the target.
+    const id_in_target = try std.fs.path.join(a, &.{ target_dir, "identity.key" });
+    defer a.free(id_in_target);
+    std.Io.Dir.cwd().access(io, id_in_target, .{}) catch {
+        try testing.expect(false); // identity.key should exist in the target dir
+    };
+}
+
+test "set/get roundtrip through symlinked .envless" {
+    if (!binAvailable(std.testing.io, "age-keygen") or !binAvailable(std.testing.io, "sops")) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var _path_buf: [4096]u8 = undefined;
+    const _path_len = try tmp.dir.realPath(io, &_path_buf);
+    const root = try a.dupe(u8, _path_buf[0.._path_len]);
+    defer a.free(root);
+
+    // Create a broken symlink so initStore exercises the symlink path.
+    const target_dir = try std.fs.path.join(a, &.{ root, "vault" });
+    defer a.free(target_dir);
+    const link_path = try std.fs.path.join(a, &.{ root, ".envless" });
+    defer a.free(link_path);
+    try std.Io.Dir.symLinkAbsolute(io, target_dir, link_path, .{ .is_directory = true });
+
+    const s = Store.init(a, io, root);
+    try s.initStore();
+    try s.set("dev", "API_KEY", "sk-symlink-test");
+
+    var r = try s.get("dev", "API_KEY");
+    defer r.deinit();
+    try testing.expect(r.found);
+    try testing.expectEqualStrings("sk-symlink-test", r.value);
 }
