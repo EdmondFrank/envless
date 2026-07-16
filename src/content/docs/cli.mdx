@@ -11,7 +11,7 @@ envless --version
 
 envless init
 envless set    KEY                        [--env=ENV]
-envless get    KEY                        [--env=ENV] --confirm
+envless get    KEY                        [--env=ENV] --confirm [--pass=TOKEN]
 envless list                              [--env=ENV]
 envless exec                              [--env=ENV] -- CMD [ARGS...]
 envless migrate FILE                      [--env=ENV] [--keep]
@@ -73,12 +73,14 @@ existing env file under the hood.
 ### `envless get KEY`
 
 Prints the plaintext value. Requires `--confirm` — printing a secret
-must be intentional.
+must be intentional. If `ENVLESS_PASS_TOKEN` is set in the env's
+secrets, `--pass=<token>` is also required and must match.
 
 | Flag | Default | Description |
 |---|---|---|
 | `--env` | `dev` | Target environment. |
 | `--confirm` | `false` | Required. Without it, the command errors out with `printing a secret requires --confirm` (exit 1). |
+| `--pass` | _(none)_ | Pass token. Required when `ENVLESS_PASS_TOKEN` is set in the env's secrets; the provided value must match. If `ENVLESS_PASS_TOKEN` is not set, this flag is ignored. |
 
 Output (with `--confirm`):
 
@@ -262,7 +264,7 @@ draft-7 JSON Schema:
 |---|---|---|---|
 | `envs` | `{}` | `{envs: ["dev", "prod"]}` | Scans `secrets/*.env.enc`. |
 | `list` | `{env}` | `{keys: ["FOO", "BAR"]}` | Sorted, no values. |
-| `get` | `{env, key, confirm:true}` | `{value: "..."}` | `confirm` must be exactly `true` (bool) or `"true"` (string). Anything else is rejected. |
+| `get` | `{env, key, confirm:true, pass?}` | `{value: "..."}` | `confirm` must be exactly `true` (bool) or `"true"` (string). `pass` required when `ENVLESS_PASS_TOKEN` is set in the env's secrets. |
 | `set` | `{env, key, value}` | `{ok: true}` | Encrypt-set one key. |
 | `exec` | `{env, argv, stdin?, cwd?}` | `{exit_code, stdout, stderr}` | Hard 300s timeout. Captures stdout+stderr in memory; cap 16 MiB each. |
 | `init` | `{path?}` | `{pubkey: "age1..."}` | Defaults `path` to MCP server cwd. |
@@ -360,7 +362,7 @@ child's exit code verbatim, and `get`, which fails fast without
 | Code | Where it comes from | Meaning |
 |---|---|---|
 | `0` | every subcommand | success |
-| `1` | envless dispatcher | unhandled error (missing arg, parse failure, file not found, sops error, `get` without `--confirm`, etc.) |
+| `1` | envless dispatcher | unhandled error (missing arg, parse failure, file not found, sops error, `get` without `--confirm`, pass token mismatch, etc.) |
 | **N** | `envless exec` | child process exited with code N (propagated via [`execenv.RunResult.non_zero`][gh-execenv]) |
 | `127` | shell or OS | binary not found on `PATH` — comes from the shell, not from `envless` |
 
@@ -376,7 +378,10 @@ child's exit code verbatim, and `get`, which fails fast without
 - **`envless get`** — `0` and prints the value on success. `1` if
   `--confirm` is absent (stderr: `printing a secret requires
   --confirm`). `1` if the key is not in the env (stderr: `key "X"
-  not found in env "Y"`). `1` if `sops decrypt` errors.
+  not found in env "Y"`). `1` if `ENVLESS_PASS_TOKEN` is set but
+  `--pass` is missing (stderr: `this env requires a pass token ...`)
+  or the provided token doesn't match (stderr: `pass token
+  mismatch`). `1` if `sops decrypt` errors.
 - **`envless list`** — `0` on success, including the empty-set case.
   `1` on decrypt or store errors.
 - **`envless exec`** — **child exit code**, verbatim, when the child

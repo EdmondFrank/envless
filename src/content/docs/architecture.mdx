@@ -163,11 +163,16 @@ decrypted env maps in memory for up to 60 seconds per `(repo, env)`
 pair, using an LRU eviction policy. It listens on a Unix domain socket
 whose path is resolved via `XDG_RUNTIME_DIR` or `~/.cache/envless/sock`.
 
-When the daemon is running, `envless exec` and `envless get` check the
-socket first. On a cache hit, the sops decrypt is skipped entirely —
-latency drops from ~200 ms (sops spawn + decrypt) to sub-millisecond
-(socket round-trip). On a cache miss, the daemon decrypts, caches, and
-returns.
+When the daemon is running, `envless exec` and `envless list` (MCP)
+check the socket first. On a cache hit, the sops decrypt is skipped
+entirely — latency drops from ~200 ms (sops spawn + decrypt) to
+sub-millisecond (socket round-trip). On a cache miss, the daemon
+decrypts, caches, and returns.
+
+The MCP `get` tool uses the store directly (not the daemon) so the
+full decrypted map is available for the `ENVLESS_PASS_TOKEN` safety
+gate check. `get` is a rare, deliberate operation; the daemon cache
+optimization is not critical here.
 
 The wire protocol (`zig/src/ipc.zig`) is line-oriented JSON over the
 Unix socket: one JSON request per line, one JSON response per line.

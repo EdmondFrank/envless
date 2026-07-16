@@ -282,10 +282,15 @@ fn buildToolsListResponse(a: std.mem.Allocator, id: json.Value) ![]const u8 {
         .{ "type", str("boolean") },
         .{ "description", str("Must be exactly true. Guards against accidental decrypt-and-return of a secret.") },
     });
+    const pass_prop = try obj(a, &.{
+        .{ "type", str("string") },
+        .{ "description", str("Pass token. Required when ENVLESS_PASS_TOKEN is set in the env's secrets.") },
+    });
     const get_props = try obj(a, &.{
         .{ "env", env_str_prop },
         .{ "key", key_str_prop },
         .{ "confirm", confirm_prop },
+        .{ "pass", pass_prop },
     });
     const get_schema = try objectSchema(a, get_props, try arr(a, &.{ str("env"), str("key"), str("confirm") }));
 
@@ -349,7 +354,7 @@ fn buildToolsListResponse(a: std.mem.Allocator, id: json.Value) ![]const u8 {
     const tools = try arr(a, &.{
         try toolDescriptor(a, "envs", "List available envs (scans secrets/*.env.enc).", envs_schema),
         try toolDescriptor(a, "list", "List keys (no values) for an env.", list_schema),
-        try toolDescriptor(a, "get", "Decrypt and return ONE secret value. confirm MUST be true.", get_schema),
+        try toolDescriptor(a, "get", "Decrypt and return ONE secret value. confirm MUST be true. If ENVLESS_PASS_TOKEN is set in the env, pass must match it.", get_schema),
         try toolDescriptor(a, "set", "Encrypt-set one key in an env.", set_schema),
         try toolDescriptor(a, "exec", "Run a child process with the env's secrets injected. 300s hard timeout.", exec_schema),
         try toolDescriptor(a, "init", "Initialize .envless/ in the target path (creates identity.key + recipients).", init_schema),
@@ -549,18 +554,19 @@ fn callGet(a: std.mem.Allocator, io: std.Io, id: json.Value, args: json.Value) !
     };
     if (!confirmed) return try toolErrorResponse(a, id, "confirm must be exactly true to return a secret");
 
+    // Optional pass token. Required when ENVLESS_PASS_TOKEN is set.
+    const pass_val: ?[]const u8 = blk: {
+        const v = args.object.get("pass") orelse break :blk null;
+        if (v != .string) break :blk null;
+        break :blk v.string;
+    };
+
     const cwd = try getCwd(a, io);
     defer a.free(cwd);
 
-    if (daemonSocketIfAlive(a, io)) |sock| {
-        defer a.free(sock);
-        if (sendDaemonGet(a, io, sock, env_val.string, key_val.string)) |value| {
-            const payload = try obj(a, &.{ .{ "value", str(value) } });
-            const text = try jsonStrAlloc(a, payload);
-            return toolTextResponse(a, id, text);
-        } else |_| {}
-    }
-
+    // Use the store directly (not the daemon) so we have the full decrypted
+    // map available for the ENVLESS_PASS_TOKEN check. `get` is a rare,
+    // deliberate operation; the daemon cache optimization is not critical here.
     const s = store.Store.init(a, io, cwd);
     var r = s.get(env_val.string, key_val.string) catch |err| {
         const msg = try std.fmt.allocPrint(a, "get failed: {s}", .{@errorName(err)});
@@ -571,6 +577,19 @@ fn callGet(a: std.mem.Allocator, io: std.Io, id: json.Value, args: json.Value) !
         const msg = try std.fmt.allocPrint(a, "key \"{s}\" not found in env \"{s}\"", .{ key_val.string, env_val.string });
         return toolErrorResponse(a, id, msg);
     }
+
+    // Safety gate: if ENVLESS_PASS_TOKEN is set in this env's secrets,
+    // the caller must provide a matching pass token.
+    if (r.map.inner.get("ENVLESS_PASS_TOKEN")) |pass_token| {
+        if (pass_val) |provided| {
+            if (!std.mem.eql(u8, provided, pass_token)) {
+                return toolErrorResponse(a, id, "pass token mismatch");
+            }
+        } else {
+            return toolErrorResponse(a, id, "this env requires a pass token (ENVLESS_PASS_TOKEN is set); provide pass in arguments");
+        }
+    }
+
     const payload = try obj(a, &.{ .{ "value", str(try a.dupe(u8, r.value)) } });
     const text = try jsonStrAlloc(a, payload);
     return toolTextResponse(a, id, text);
@@ -955,6 +974,12 @@ test "handleLine: tools/list returns 8 tools" {
     for (names, 0..) |want, i| {
         try testing.expectEqualStrings(want, tools.items[i].object.get("name").?.string);
     }
+    // Verify get tool schema includes the pass property.
+    const get_tool = tools.items[2].object;
+    try testing.expectEqualStrings("get", get_tool.get("name").?.string);
+    const get_props = get_tool.get("inputSchema").?.object.get("properties").?.object;
+    try testing.expect(get_props.get("pass") != null);
+    try testing.expectEqualStrings("string", get_props.get("pass").?.object.get("type").?.string);
 }
 
 test "handleLine: ping returns empty object" {

@@ -189,7 +189,7 @@ fn printUsage(ctx: *Context) !void {
     try w.interface.print("{s}Commands:{s}\n", .{ b, r });
     try w.interface.writeAll("  init       initialize .envless/ in the current directory\n");
     try w.interface.writeAll("  set KEY    store a secret value from stdin (--env=NAME, default: dev)\n");
-    try w.interface.writeAll("  get KEY    print a secret value (requires --confirm)\n");
+    try w.interface.writeAll("  get KEY    print a secret value (requires --confirm, --pass if ENVLESS_PASS_TOKEN is set)\n");
     try w.interface.writeAll("  list       list keys in an env (does not print values)\n");
     try w.interface.writeAll("  exec       run a command with secrets injected as env vars\n");
     try w.interface.writeAll("  migrate    encrypt a .env file into envless and gitignore the plaintext\n");

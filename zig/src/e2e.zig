@@ -365,6 +365,190 @@ test "TestE2E_GetRequiresConfirm" {
     }
 }
 
+test "TestE2E_GetWithPassToken" {
+    try skipIfMissing(&.{ "age-keygen", "sops" });
+    const a = testing.allocator;
+    const bin = try resolveBin(a);
+    defer a.free(bin);
+
+    const dir = try makeTmpDir(a);
+    defer a.free(dir);
+    defer rmTreeAbs(dir);
+
+    // Bootstrap: init + set a secret + set ENVLESS_PASS_TOKEN.
+    {
+        var out = try runEnvlessOk(a, bin, dir, null, &.{"init"});
+        defer out.deinit(a);
+    }
+    {
+        var out = try runEnvlessOk(a, bin, dir, "secret-val", &.{ "set", "API_KEY" });
+        defer out.deinit(a);
+    }
+    {
+        var out = try runEnvlessOk(a, bin, dir, "my-pass-token", &.{ "set", "ENVLESS_PASS_TOKEN" });
+        defer out.deinit(a);
+    }
+
+    // Get without --pass when ENVLESS_PASS_TOKEN is set: should fail.
+    {
+        var out = try runEnvless(a, bin, dir, null, &.{ "get", "API_KEY", "--confirm" });
+        defer out.deinit(a);
+        if (out.code == 0) {
+            std.debug.print("get without --pass should fail when ENVLESS_PASS_TOKEN is set:\n{s}\n", .{out.stdout});
+            return error.TestExpectedFailure;
+        }
+        if (std.mem.indexOf(u8, out.stderr, "pass token") == null) {
+            std.debug.print("want stderr mentioning pass token, got: {s}\n", .{out.stderr});
+            return error.TestMissingPassTokenMention;
+        }
+    }
+
+    // Get with wrong --pass: should fail.
+    {
+        var out = try runEnvless(a, bin, dir, null, &.{ "get", "API_KEY", "--confirm", "--pass=wrong-token" });
+        defer out.deinit(a);
+        if (out.code == 0) {
+            std.debug.print("get with wrong --pass should fail:\n{s}\n", .{out.stdout});
+            return error.TestExpectedFailure;
+        }
+        if (std.mem.indexOf(u8, out.stderr, "mismatch") == null) {
+            std.debug.print("want stderr mentioning mismatch, got: {s}\n", .{out.stderr});
+            return error.TestMissingMismatchMention;
+        }
+    }
+
+    // Get with correct --pass: should print.
+    {
+        var out = try runEnvless(a, bin, dir, null, &.{ "get", "API_KEY", "--confirm", "--pass=my-pass-token" });
+        defer out.deinit(a);
+        try testing.expectEqual(@as(u8, 0), out.code);
+        try testing.expectEqualStrings("secret-val", trim(out.stdout));
+    }
+}
+
+test "TestE2E_GetWithoutPassTokenBackwardCompat" {
+    try skipIfMissing(&.{ "age-keygen", "sops" });
+    const a = testing.allocator;
+    const bin = try resolveBin(a);
+    defer a.free(bin);
+
+    const dir = try makeTmpDir(a);
+    defer a.free(dir);
+    defer rmTreeAbs(dir);
+
+    // Bootstrap: init + set a secret (no ENVLESS_PASS_TOKEN).
+    {
+        var out = try runEnvlessOk(a, bin, dir, null, &.{"init"});
+        defer out.deinit(a);
+    }
+    {
+        var out = try runEnvlessOk(a, bin, dir, "secret-val", &.{ "set", "API_KEY" });
+        defer out.deinit(a);
+    }
+
+    // Get with --confirm but no --pass: should succeed (no ENVLESS_PASS_TOKEN set).
+    {
+        var out = try runEnvless(a, bin, dir, null, &.{ "get", "API_KEY", "--confirm" });
+        defer out.deinit(a);
+        try testing.expectEqual(@as(u8, 0), out.code);
+        try testing.expectEqualStrings("secret-val", trim(out.stdout));
+    }
+
+    // Get with --confirm and --pass (ignored when no ENVLESS_PASS_TOKEN): should succeed.
+    {
+        var out = try runEnvless(a, bin, dir, null, &.{ "get", "API_KEY", "--confirm", "--pass=anything" });
+        defer out.deinit(a);
+        try testing.expectEqual(@as(u8, 0), out.code);
+        try testing.expectEqualStrings("secret-val", trim(out.stdout));
+    }
+}
+
+test "TestE2E_McpGetWithPassToken" {
+    try skipIfMissing(&.{ "age-keygen", "sops" });
+    const a = testing.allocator;
+    const bin = try resolveBin(a);
+    defer a.free(bin);
+
+    const dir = try makeTmpDir(a);
+    defer a.free(dir);
+    defer rmTreeAbs(dir);
+
+    // Bootstrap a real envless repo.
+    {
+        var out = try runEnvlessOk(a, bin, dir, null, &.{"init"});
+        defer out.deinit(a);
+    }
+
+    // Set a secret + ENVLESS_PASS_TOKEN via MCP, then get with and without pass.
+    const script =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"set\",\"arguments\":{\"env\":\"dev\",\"key\":\"API_KEY\",\"value\":\"secret-val\"}}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"set\",\"arguments\":{\"env\":\"dev\",\"key\":\"ENVLESS_PASS_TOKEN\",\"value\":\"my-pass-token\"}}}\n" ++
+        // get without pass → should error (isError=true)
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"get\",\"arguments\":{\"env\":\"dev\",\"key\":\"API_KEY\",\"confirm\":true}}}\n" ++
+        // get with wrong pass → should error (isError=true)
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"get\",\"arguments\":{\"env\":\"dev\",\"key\":\"API_KEY\",\"confirm\":true,\"pass\":\"wrong\"}}}\n" ++
+        // get with correct pass → should succeed
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"get\",\"arguments\":{\"env\":\"dev\",\"key\":\"API_KEY\",\"confirm\":true,\"pass\":\"my-pass-token\"}}}\n";
+    var out = try runMcpScript(a, bin, dir, script);
+    defer out.deinit(a);
+    try testing.expectEqual(@as(u8, 0), out.code);
+
+    // id=4: get without pass → isError=true
+    if (std.mem.indexOf(u8, out.stdout, "\"id\":4") == null) {
+        std.debug.print("missing id=4 response:\n{s}\n", .{out.stdout});
+        return error.TestMissingResponse;
+    }
+    // The isError=true for id=4 should appear before id=5's response.
+    // We check that the id=4 response contains isError:true.
+    {
+        const id4_idx = std.mem.indexOf(u8, out.stdout, "\"id\":4") orelse {
+            std.debug.print("missing id=4:\n{s}\n", .{out.stdout});
+            return error.TestMissingResponse;
+        };
+        const id5_idx = std.mem.indexOf(u8, out.stdout, "\"id\":5") orelse out.stdout.len;
+        const id4_block = out.stdout[id4_idx..id5_idx];
+        if (std.mem.indexOf(u8, id4_block, "\"isError\":true") == null) {
+            std.debug.print("expected isError=true for get without pass (id=4):\n{s}\n", .{id4_block});
+            return error.TestGetWithoutPassShouldFail;
+        }
+    }
+
+    // id=5: get with wrong pass → isError=true
+    {
+        const id5_idx = std.mem.indexOf(u8, out.stdout, "\"id\":5") orelse {
+            std.debug.print("missing id=5:\n{s}\n", .{out.stdout});
+            return error.TestMissingResponse;
+        };
+        const id6_idx = std.mem.indexOf(u8, out.stdout, "\"id\":6") orelse out.stdout.len;
+        const id5_block = out.stdout[id5_idx..id6_idx];
+        if (std.mem.indexOf(u8, id5_block, "\"isError\":true") == null) {
+            std.debug.print("expected isError=true for get with wrong pass (id=5):\n{s}\n", .{id5_block});
+            return error.TestGetWrongPassShouldFail;
+        }
+    }
+
+    // id=6: get with correct pass → value=secret-val
+    {
+        const id6_idx = std.mem.indexOf(u8, out.stdout, "\"id\":6") orelse {
+            std.debug.print("missing id=6:\n{s}\n", .{out.stdout});
+            return error.TestMissingResponse;
+        };
+        const id6_block = out.stdout[id6_idx..];
+        // The value is JSON-escaped inside the text field, so we search for
+        // the raw value rather than the quoted key-value pair.
+        if (std.mem.indexOf(u8, id6_block, "secret-val") == null) {
+            std.debug.print("expected value containing secret-val for get with correct pass (id=6):\n{s}\n", .{id6_block});
+            return error.TestGetWithPassFailed;
+        }
+        // Verify it's not an error.
+        if (std.mem.indexOf(u8, id6_block, "\"isError\":false") == null) {
+            std.debug.print("expected isError=false for get with correct pass (id=6):\n{s}\n", .{id6_block});
+            return error.TestGetWithPassFailed;
+        }
+    }
+}
+
 test "TestE2E_Migrate" {
     try skipIfMissing(&.{ "age-keygen", "sops" });
     const a = testing.allocator;
@@ -530,19 +714,21 @@ fn runMcpScript(
     if (child.stdout) |so| {
         var r_buf: [4096]u8 = undefined;
         var sr = so.reader(io, &r_buf);
+        var data_buf: [4096]u8 = undefined;
         while (true) {
-            const n = sr.interface.readSliceShort(&r_buf) catch break;
+            const n = sr.interface.readSliceShort(&data_buf) catch break;
             if (n == 0) break;
-            try stdout_buf.appendSlice(allocator, r_buf[0..n]);
+            try stdout_buf.appendSlice(allocator, data_buf[0..n]);
         }
     }
     if (child.stderr) |se| {
         var r_buf: [4096]u8 = undefined;
         var sr = se.reader(io, &r_buf);
+        var data_buf: [4096]u8 = undefined;
         while (true) {
-            const n = sr.interface.readSliceShort(&r_buf) catch break;
+            const n = sr.interface.readSliceShort(&data_buf) catch break;
             if (n == 0) break;
-            try stderr_buf.appendSlice(allocator, r_buf[0..n]);
+            try stderr_buf.appendSlice(allocator, data_buf[0..n]);
         }
     }
 

@@ -45,6 +45,7 @@ echo "age1abcd..." >> .envless/recipients
 
 # 2. Re-encrypt every env so the new recipient is in the data-key
 #    wrap. v0.0.1 has no `envless re-encrypt`; the portable approach:
+#    (If ENVLESS_PASS_TOKEN is set in an env, add --pass=<token> to get.)
 for env in dev prod; do
   for key in $(envless list --env="$env"); do
     val=$(envless get "$key" --env="$env" --confirm)

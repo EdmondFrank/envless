@@ -61,8 +61,11 @@ secrets manager.
   Every committed file (`secrets/*.env.enc`, `.envless/recipients`)
   is either encrypted or a public-key list.
 - **Casual shoulder-surfing.** `envless list` prints keys but never
-  values. `envless get` requires `--confirm`. `envless exec` writes
-  secrets only into the child process's env array — never stdout.
+  values. `envless get` requires `--confirm`. When `ENVLESS_PASS_TOKEN`
+  is set in an env's secrets, `--pass=<token>` is also required — a
+  second knowledge factor that must match the stored token.
+  `envless exec` writes secrets only into the child process's env
+  array — never stdout.
 - **Lost laptop with FDE on, no `identity.key` extractable.** Without
   the age secret key, encrypted files in the repo are bytes of
   ciphertext.
@@ -98,7 +101,8 @@ secrets manager.
   signatures on the shelled-out binaries. Pin versions and use your
   distro's verified packages.
 - **Side channels in your editor / shell history.** `envless get
-  --confirm` prints plaintext. So does `echo $SECRET`. If you type
+  --confirm` prints plaintext (and `--pass=<token>` when
+  `ENVLESS_PASS_TOKEN` is set). So does `echo $SECRET`. If you type
   the secret on stdin during `envless set`, your `bash` history will
   remember `echo "..." | envless set`. Use `read -s` or paste via a
   here-string with leading whitespace.
@@ -296,6 +300,7 @@ ciphertext rotation, not just a header rewrap), the portable approach
 through the `envless` CLI works on v0.0.1 with no additional config:
 
 ```bash
+# If ENVLESS_PASS_TOKEN is set in an env, add --pass=<token> to each get.
 for env in dev prod; do
   # Snapshot before for a verifiable diff.
   envless exec --env="$env" -- env | sort > /tmp/envless-before-$env.txt
@@ -484,7 +489,9 @@ operators most often break the model.
 
 - **Never paste `envless get FOO --confirm` output into a prompt.**
   Even with retention-zero providers, the value transits the
-  provider's API and may be cached.
+  provider's API and may be cached. (When `ENVLESS_PASS_TOKEN` is set,
+  the command also needs `--pass=<token>` — but the output is the same
+  plaintext value, so the same caution applies.)
 - **Use `envless exec -- agent-cli` instead of pre-resolving values.**
   The child process gets the env; the agent's transcript does not.
 - **Agent tools that introspect the env** (e.g. "what's in your

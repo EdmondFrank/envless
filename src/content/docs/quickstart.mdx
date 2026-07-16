@@ -123,10 +123,18 @@ envless migrate .env --keep
 ## Read a value back
 
 `get` requires `--confirm` to print plaintext. Prevents accidental
-shell-history leaks.
+shell-history leaks. If `ENVLESS_PASS_TOKEN` is set in the env's
+secrets, `--pass=<token>` is also required.
 
 ```bash
 envless get OPENAI_API_KEY --confirm
+```
+
+To enable the pass token gate, set `ENVLESS_PASS_TOKEN` in any env:
+
+```bash
+echo "my-secret-token" | envless set ENVLESS_PASS_TOKEN
+envless get OPENAI_API_KEY --confirm --pass=my-secret-token
 ```
 
 For programmatic use, prefer `envless exec` — the plaintext stays

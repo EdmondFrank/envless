@@ -23,7 +23,9 @@ when:
   shelling into `ls secrets/` and parsing filenames.
 - You want **`get` gated by an explicit `confirm:true` argument** that
   the agent must construct on purpose — a far stronger guard than the
-  shell's `--confirm` flag.
+  shell's `--confirm` flag. When `ENVLESS_PASS_TOKEN` is set in the
+  env's secrets, the agent must also supply a matching `pass` argument,
+  adding a third layer of defense.
 
 The eight tools — `envs`, `list`, `get`, `set`, `exec`, `init`,
 `migrate`, `whoami` — are documented in detail under
@@ -149,6 +151,11 @@ your host configured to always-allow `get`, a malformed call without
 `confirm:true` will return `isError:true`. That is the second line of
 defense; the host's per-call confirm is the first.
 
+When `ENVLESS_PASS_TOKEN` is set in the env's secrets, a third layer
+applies: the `pass` argument must match the stored token. This is
+opt-in per env — repos without `ENVLESS_PASS_TOKEN` work exactly as
+before.
+
 ## Performance — pair with the daemon
 
 For agent workloads that hit `envless` dozens of times per minute, the
@@ -179,6 +186,12 @@ first, or call the `init` tool with the desired `path`.
 the host either omitted `confirm` or sent `confirm:false`. Send
 `confirm:true` as a JSON boolean (the string `"true"` is also
 accepted, but other strings and `1`/`0` are not).
+
+**`get` returns `pass token mismatch` or `this env requires a pass
+token`** — the env has `ENVLESS_PASS_TOKEN` set in its secrets. You
+must provide a `pass` argument whose value matches the stored token.
+To set or change the token, use `envless set ENVLESS_PASS_TOKEN` (CLI)
+or the `set` tool (MCP).
 
 **`exec` returns `exit_code: -15` (or another negative number)** —
 the child was killed by signal. `-15` is SIGTERM, often because the
